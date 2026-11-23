@@ -221,3 +221,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# ---- SteadyLink ----
+__pycache__/
+*.pyc
+runtime/
+bin/
+nodes.json
+config.json
+site_rules.json
+dl_tasks.json
+dl_history.json
+download.log
+用量统计.json
+用量历史.csv
+*.parts/
+*.hls_parts/
+*.lnk
+*.tmp

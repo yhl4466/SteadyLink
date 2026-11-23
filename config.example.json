@@ -1,0 +1,17 @@
+{
+  "http_port": 10901,
+  "socks_port": 10902,
+  "stats_port": 10085,
+  "subscription": "",
+  "auto_update_hours": 0,
+  "auto_failover": false,
+  "auto_sort_after_test": true,
+  "tz_follow": false,
+  "tz_restore": "China Standard Time",
+  "auto_ip_check": true,
+  "core_log_level": "info",
+  "access_log": true,
+  "minimize_to_tray": true,
+  "dl_threads": 8,
+  "dl_proxy": true
+}

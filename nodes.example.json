@@ -1,0 +1,6 @@
+[
+  {
+    "remark": "示例节点（请替换为真实节点）",
+    "link": "vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=REPLACE_ME&sid=00&type=tcp&flow=xtls-rprx-vision#示例节点"
+  }
+]
