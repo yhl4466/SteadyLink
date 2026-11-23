@@ -1332,7 +1332,11 @@ class DownloaderWindow(tk.Toplevel):
         self.worker = None
         self._last_save = 0
         self.save_dir = app.cfg.get('dl_dir') or os.path.join(os.path.expanduser('~'), 'Downloads')
-        os.makedirs(self.save_dir, exist_ok=True)
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+        except Exception:
+            self.save_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+            os.makedirs(self.save_dir, exist_ok=True)
 
         head = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         head.pack(fill='x')

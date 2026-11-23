@@ -15,7 +15,7 @@
 
 | 主界面 + 实时日志 | 万能下载器 |
 |---|---|
-| ![主界面](docs/screenshots/logs.png) | ![下载器](docs/screenshots/downloader.png) |
+| ![主界面](docs/screenshots/main.png) | ![下载器](docs/screenshots/downloader.png) |
 
 ![站点代理规则](docs/screenshots/rules.png)
 
