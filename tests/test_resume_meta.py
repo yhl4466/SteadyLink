@@ -67,6 +67,22 @@ class ResumeMetaTest(unittest.TestCase):
         self.assertNotEqual(d0, dl.hls_digest(changed_iv))
         self.assertEqual(d0, dl.hls_digest([dict(x) for x in base]))
 
+    def test_hls_key_hash_change_purged(self):
+        base = {'url': 'http://x/p.m3u8', 'count': 2, 'digest': 'd1',
+                'key_hashes': {'http://x/k': 'aaa'}, 'mode': 'hls'}
+        self._seed(base)
+        dl._prepare_parts_meta(self.out, self.part, dict(base, key_hashes={'http://x/k': 'bbb'}))
+        self.assertFalse(os.path.isdir(self.part))
+
+    def test_hls_digest_covers_byterange_and_map(self):
+        base = [{'uri': 'http://x/1.ts', 'seq': 0, 'key': None, 'byterange': '100@0',
+                 'map': {'uri': 'http://x/init.mp4', 'byterange': ''}}]
+        byterange_changed = [dict(base[0], byterange='200@0')]
+        map_changed = [dict(base[0], map={'uri': 'http://x/init2.mp4', 'byterange': ''})]
+        d0 = dl.hls_digest(base)
+        self.assertNotEqual(d0, dl.hls_digest(byterange_changed))
+        self.assertNotEqual(d0, dl.hls_digest(map_changed))
+
     def test_unknown_parts_without_meta_purged(self):
         os.makedirs(self.part, exist_ok=True)
         _write(os.path.join(self.part, '00000.part'), b'x')

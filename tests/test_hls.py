@@ -9,6 +9,11 @@ def _read(path):
     with open(path, 'rb') as fh:
         return fh.read()
 
+
+def _write(path, data):
+    with open(path, 'wb') as fh:
+        fh.write(data)
+
 try:
     from Crypto.Cipher import AES
     HAS_CRYPTO = True
@@ -64,6 +69,75 @@ class HlsTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn('解密', msg)
             self.assertFalse(os.path.exists(out))
+        finally:
+            srv.close()
+
+    def test_byterange_rejected(self):
+        pl = (b'#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:4\n'
+              b'#EXT-X-BYTERANGE:100@0\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n')
+        srv = StaticServer({'/playlist.m3u8': (pl, 'application/vnd.apple.mpegurl')})
+        try:
+            ok, msg = dl.hls_download(srv.url('/playlist.m3u8'),
+                                      os.path.join(self.tmp, 'br.ts'), threads=1)
+            self.assertFalse(ok)
+            self.assertIn('BYTERANGE', msg)
+        finally:
+            srv.close()
+
+    def test_init_map_rejected(self):
+        pl = (b'#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n'
+              b'#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n')
+        srv = StaticServer({'/playlist.m3u8': (pl, 'application/vnd.apple.mpegurl')})
+        try:
+            ok, msg = dl.hls_download(srv.url('/playlist.m3u8'),
+                                      os.path.join(self.tmp, 'map.ts'), threads=1)
+            self.assertFalse(ok)
+            self.assertIn('EXT-X-MAP', msg)
+        finally:
+            srv.close()
+
+    def test_key_hash_recorded_in_meta(self):
+        srv = StaticServer({'/playlist.m3u8': (self._playlist(), 'application/vnd.apple.mpegurl'),
+                            '/key.bin': (self.key, 'application/octet-stream'),
+                            '/seg0.ts': (self.segs[0], 'video/mp2t'),
+                            '/seg1.ts': (self.segs[1], 'video/mp2t')})
+        captured = {}
+        orig = dl._prepare_parts_meta
+        def fake(out_path, part_dir, meta):
+            captured.update(meta)
+            return False
+        dl._prepare_parts_meta = fake
+        try:
+            ok, msg = dl.hls_download(srv.url('/playlist.m3u8'),
+                                      os.path.join(self.tmp, 'meta.ts'), threads=2)
+            self.assertTrue(ok, msg)
+        finally:
+            dl._prepare_parts_meta = orig
+            srv.close()
+        import hashlib
+        kh = captured.get('key_hashes') or {}
+        self.assertEqual(list(kh.values())[0], hashlib.sha256(self.key).hexdigest())
+
+    def test_key_content_change_purges_parts(self):
+        import json
+        srv = StaticServer({'/playlist.m3u8': (self._playlist(), 'application/vnd.apple.mpegurl'),
+                            '/key.bin': (self.key, 'application/octet-stream'),
+                            '/seg0.ts': (self.segs[0], 'video/mp2t'),
+                            '/seg1.ts': (self.segs[1], 'video/mp2t')})
+        try:
+            url = srv.url('/playlist.m3u8')
+            variants, segs = dl.parse_m3u8(self._playlist().decode(), url)
+            out = os.path.join(self.tmp, 'keychange.ts')
+            part_dir = out + '.hls_parts'
+            os.makedirs(part_dir, exist_ok=True)
+            _write(os.path.join(part_dir, '000000.ts'), b'old-part')
+            meta = {'url': url, 'count': len(segs), 'digest': dl.hls_digest(segs),
+                    'key_hashes': {srv.url('/key.bin'): 'deadbeef'}, 'mode': 'hls'}
+            with open(out + '.parts.json', 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False)
+            ok, msg = dl.hls_download(url, out, threads=2)
+            self.assertTrue(ok, msg)
+            self.assertEqual(_read(out), b''.join(self.plain))
         finally:
             srv.close()
 

@@ -187,12 +187,21 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8,
             return 'changed' if (etag or last_modified) else 'norange'
         if etag:
             got = re.search(r'ETag:\s*([^\r\n]+)', head, re.I)
-            if got and got.group(1).strip() != etag:
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
-                return 'changed'
+            if got:
+                if got.group(1).strip() != etag:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
+                    return 'changed'
+            elif last_modified:
+                lm = re.search(r'Last-Modified:\s*([^\r\n]+)', head, re.I)
+                if lm and lm.group(1).strip() != last_modified:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
+                    return 'changed'
         if code not in ('206',) or add <= 0:
             try:
                 os.unlink(tmp)
@@ -324,8 +333,7 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
         import shutil as _sh
         _sh.rmtree(part_dir, ignore_errors=True)
         return _download_single(url, out_path, proxy, progress, stop, max_seconds,
-                                etag=info.get('etag', ''),
-                                last_modified=info.get('last_modified', ''))
+                                etag=etag, last_modified=last_modified)
     if 'error' in results:
         return False, '分片下载失败（已保留分片，可重试续传）'
     # 严格校验每个分片大小
@@ -361,7 +369,7 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds,
     if old != meta:
         _write_json_file(_parts_meta_path(out_path), meta)
     resume = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    args = ['curl.exe', '-sS', '--ssl-no-revoke', '-L', '--max-time', '7200', '-A', UA,
+    args = ['curl.exe', '-sS', '-f', '--ssl-no-revoke', '-L', '--max-time', '7200', '-A', UA,
             '-o', out_path, '--progress-bar']
     if resume:
         args += ['-C', '-']
@@ -400,8 +408,7 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds,
         # 服务器不支持续传：删掉半截文件重下一遍
         _remove_file(out_path)
         return _download_single(url, out_path, proxy, progress, stop, max_seconds,
-                                etag=info.get('etag', ''),
-                                last_modified=info.get('last_modified', ''))
+                                etag=etag, last_modified=last_modified)
     if ok:
         _remove_file(_parts_meta_path(out_path))
         return True, out_path
@@ -486,6 +493,8 @@ def parse_m3u8(text, base_url):
     lines = [l.strip() for l in (text or '').splitlines() if l.strip()]
     variants, segs, key = [], [], None
     media_seq = 0
+    cur_map = None
+    pending_range = None
     for i, line in enumerate(lines):
         if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
             try:
@@ -497,6 +506,14 @@ def parse_m3u8(text, base_url):
             if i + 1 < len(lines) and not lines[i + 1].startswith('#'):
                 variants.append((int(bw.group(1)) if bw else 0,
                                  urllib.parse.urljoin(base_url, lines[i + 1])))
+        elif line.startswith('#EXT-X-MAP:'):
+            mu = re.search(r'URI="([^"]+)"', line)
+            mb = re.search(r'BYTERANGE="([^"]+)"', line)
+            if mu:
+                cur_map = {'uri': urllib.parse.urljoin(base_url, mu.group(1)),
+                           'byterange': mb.group(1) if mb else ''}
+        elif line.startswith('#EXT-X-BYTERANGE:'):
+            pending_range = line.split(':', 1)[1].strip()
         elif line.startswith('#EXT-X-KEY'):
             m = re.search(r'METHOD=([^,]+)', line)
             method = (m.group(1) if m else 'NONE').strip()
@@ -509,7 +526,9 @@ def parse_m3u8(text, base_url):
                 key = None
         elif not line.startswith('#'):
             segs.append({'uri': urllib.parse.urljoin(base_url, line), 'key': key,
-                         'seq': media_seq + len(segs)})
+                         'seq': media_seq + len(segs), 'byterange': pending_range,
+                         'map': cur_map})
+            pending_range = None
     return variants, segs
 
 
@@ -519,9 +538,11 @@ def hls_digest(segs):
     lines = []
     for s in segs or []:
         k = s.get('key') or {}
+        m = s.get('map') or {}
         lines.append('|'.join([
             str(s.get('seq', '')), s.get('uri', ''),
             str(k.get('method', '')), str(k.get('uri', '')), str(k.get('iv') or ''),
+            str(s.get('byterange') or ''), str(m.get('uri') or ''), str(m.get('byterange') or ''),
         ]))
     return hashlib.sha256('\n'.join(lines).encode('utf-8')).hexdigest()
 
@@ -571,8 +592,20 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
                    if seg.get('key') and seg['key'].get('method', '').upper() not in ('AES-128',)}
     if bad_methods:
         return False, f'不支持的 HLS 加密方式：{", ".join(sorted(bad_methods))}'
+    if any(s.get('byterange') for s in segs) or any(s.get('map') for s in segs):
+        return False, '暂不支持 EXT-X-BYTERANGE / EXT-X-MAP（fMP4/切片流）'
+    import hashlib as _hl
+    key_hashes = {}
+    for seg in segs:
+        k = seg.get('key')
+        if k and k.get('method', '').upper() == 'AES-128':
+            u = k['uri']
+            if u not in key_hashes:
+                _, kb = _fetch_bytes(u, proxy, timeout=30)
+                key_hashes[u] = _hl.sha256(kb).hexdigest() if kb else ''
     part_dir = out_path + '.hls_parts'
-    hls_meta = {'url': url, 'count': total, 'digest': hls_digest(segs), 'mode': 'hls'}
+    hls_meta = {'url': url, 'count': total, 'digest': hls_digest(segs),
+                'key_hashes': key_hashes, 'mode': 'hls'}
     _prepare_parts_meta(out_path, part_dir, hls_meta)
     os.makedirs(part_dir, exist_ok=True)
     done = [0]

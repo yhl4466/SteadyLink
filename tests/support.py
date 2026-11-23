@@ -80,15 +80,17 @@ class RangeServer:
       badcr   —— 返回 206 但 Content-Range 区间错误
     """
 
-    def __init__(self, data, mode='range', etag_mode=None):
+    def __init__(self, data, mode='range', etag_mode=None, send_etag=True):
         self.data = bytes(data)
         self.mode = mode
         self.etag_mode = etag_mode
+        self.send_etag = send_etag
         handler = self._make_handler()
         self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), handler)
         self.httpd.data = self.data
         self.httpd.mode = mode
         self.httpd.etag_mode = etag_mode
+        self.httpd.send_etag = send_etag
         self.httpd.requests = 0
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -112,6 +114,16 @@ class RangeServer:
                 data = srv.data
                 rng = self.headers.get('Range')
                 srv.requests += 1
+                if srv.mode == 'range_then_plain' and srv.requests > 1:
+                    # 探测时支持 Range，真正下载分片时又不支持了
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(data)))
+                    self.send_header('Content-Type', 'application/octet-stream')
+                    if srv.send_etag:
+                        self.send_header('ETag', '"v1"')
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if srv.etag_mode == 'change':
                     etag = '"v1"' if srv.requests == 1 else '"v2"'
                 else:
@@ -121,7 +133,8 @@ class RangeServer:
                     # 资源已变化：按规范忽略 Range，返回整个文件
                     self.send_response(200)
                     self.send_header('Content-Length', str(len(data)))
-                    self.send_header('ETag', etag)
+                    if srv.send_etag:
+                        self.send_header('ETag', etag)
                     self.end_headers()
                     self.wfile.write(data)
                     return
@@ -129,7 +142,8 @@ class RangeServer:
                     self.send_response(200)
                     self.send_header('Content-Length', str(len(data)))
                     self.send_header('Content-Type', 'application/octet-stream')
-                    self.send_header('ETag', etag)
+                    if srv.send_etag:
+                        self.send_header('ETag', etag)
                     self.end_headers()
                     self.wfile.write(data)
                     return
@@ -145,7 +159,8 @@ class RangeServer:
                 else:
                     self.send_header('Content-Range', f'bytes {start}-{end}/{len(data)}')
                 self.send_header('Content-Length', str(len(chunk)))
-                self.send_header('ETag', etag)
+                if srv.send_etag:
+                    self.send_header('ETag', etag)
                 self.end_headers()
                 self.wfile.write(chunk)
         return H

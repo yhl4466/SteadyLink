@@ -1,5 +1,5 @@
 """HTTP 下载：Range 校验、回退单流、分片合并与大小校验。"""
-import os, tempfile, shutil, threading, unittest
+import json, os, tempfile, shutil, threading, unittest
 
 from .support import RangeServer
 import downloader as dl
@@ -108,6 +108,32 @@ class HttpRangeTest(unittest.TestCase):
             ok, msg = dl.download(srv.url, out, threads=2, chunk=64 * 1024)
             self.assertTrue(ok, msg)          # 检测到变化 -> 重新探测后重下一次
             self.assertEqual(_read(out), self.data)
+        finally:
+            srv.close()
+
+    def test_fallback_when_range_disappears_after_probe(self):
+        # 探测时支持 Range，分片下载时服务器却不支持了 -> 必须回退单流且不崩
+        srv = RangeServer(self.data, 'range_then_plain', send_etag=False)
+        try:
+            out = os.path.join(self.tmp, 'range_gone.bin')
+            ok, msg = dl.download(srv.url, out, threads=2, chunk=64 * 1024)
+            self.assertTrue(ok, msg)
+            self.assertEqual(_read(out), self.data)
+        finally:
+            srv.close()
+
+    def test_single_retry_does_not_crash(self):
+        # 预置半截文件与匹配的元数据，模拟续传失败后的递归重试分支
+        out = os.path.join(self.tmp, 'single.bin')
+        _write(out, b'partial')
+        srv = RangeServer(self.data, 'range')
+        try:
+            url = srv.url.replace('/file', '/missing')
+            with open(out + '.parts.json', 'w', encoding='utf-8') as f:
+                json.dump({'url': url, 'mode': 'single', 'etag': '', 'last_modified': ''}, f)
+            ok, msg = dl._download_single(url, out, None, None,
+                                          threading.Event(), None, etag='', last_modified='')
+            self.assertFalse(ok)
         finally:
             srv.close()
 
