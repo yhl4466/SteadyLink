@@ -1147,7 +1147,7 @@ class App:
                 return False
             t0 = time.time()
             self.log(f'尝试重连原节点（第 {attempt} 次）...')
-            self.core.stop()
+            self.core.stop(self.core.current_token())
             if stop.is_set() or self.conn_gen != gen:
                 return False
             token = self.core.start(node, self.cfg,
@@ -1225,7 +1225,8 @@ class App:
                     self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
                     self.q.put(('refresh', None))
                     return True
-            self.core.stop()
+            if token:
+                self.core.stop(token)
         self.log('✗ 备用节点均连接失败，请手动选择')
         self.q.put(('status', '● 节点异常（切换失败）'))
         return False

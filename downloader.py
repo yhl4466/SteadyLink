@@ -134,7 +134,8 @@ def _prepare_parts_meta(out_path, part_dir, meta):
     return stale
 
 
-def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
+def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8,
+                 etag='', last_modified=''):
     """下载一个分段；严格校验 206 状态、Content-Range 与长度。
     返回 'ok' / 'norange'（服务器忽略 Range）/ 'error' / 'stopped'。"""
     need = end - start + 1
@@ -155,6 +156,10 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
         hdr = part + '.hdr'
         args = ['-L', '-D', hdr, '-r', f'{start + have}-{end}', '--max-time', '120',
                 '-A', UA, '-o', tmp, '-w', '%{http_code}']
+        if etag and not str(etag).startswith('W/'):
+            args += ['-H', f'If-Range: {etag}']
+        elif last_modified:
+            args += ['-H', f'If-Range: {last_modified}']
         if proxy:
             args += ['-x', proxy]
         try:
@@ -178,7 +183,16 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
                 os.unlink(tmp)
             except Exception:
                 pass
-            return 'norange'
+            # 带了 If-Range 却拿到 200：资源已变化（或服务器不支持 Range）
+            return 'changed' if (etag or last_modified) else 'norange'
+        if etag:
+            got = re.search(r'ETag:\s*([^\r\n]+)', head, re.I)
+            if got and got.group(1).strip() != etag:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                return 'changed'
         if code not in ('206',) or add <= 0:
             try:
                 os.unlink(tmp)
@@ -230,9 +244,18 @@ def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
     if info.get('error'):
         return False, f"探测失败：{info['error']}"
     if info.get('range') is not None and info.get('size') and info['range'] and threads > 1:
-        return _download_segments(url, out_path, info['size'], proxy, threads, chunk, progress,
-                                  stop, max_seconds, etag=info.get('etag', ''),
-                                  last_modified=info.get('last_modified', ''))
+        ok, msg = _download_segments(url, out_path, info['size'], proxy, threads, chunk, progress,
+                                     stop, max_seconds, etag=info.get('etag', ''),
+                                     last_modified=info.get('last_modified', ''))
+        if not ok and msg == 'RESOURCE_CHANGED':
+            # 文件在下载过程中被替换：重新探测一次再下载
+            info2 = probe(url, proxy)
+            if info2.get('range') and info2.get('size'):
+                return _download_segments(url, out_path, info2['size'], proxy, threads, chunk,
+                                          progress, stop, max_seconds,
+                                          etag=info2.get('etag', ''),
+                                          last_modified=info2.get('last_modified', ''))
+        return ok, msg
     return _download_single(url, out_path, proxy, progress, stop, max_seconds)
 
 
@@ -282,7 +305,8 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
     def work(c):
         i, s, e = c
         part = os.path.join(part_dir, f'{i:05d}.part')
-        return _fetch_chunk(url, part, s, e, proxy, stop, on_bytes)
+        return _fetch_chunk(url, part, s, e, proxy, stop, on_bytes,
+                            etag=etag, last_modified=last_modified)
 
     with cf.ThreadPoolExecutor(max_workers=max(1, int(threads))) as ex:
         results = list(ex.map(work, chunks))
@@ -291,11 +315,17 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
         progress(done[0], size, 0)
     if stop.is_set() or 'stopped' in results:
         return False, '已取消（已保留分片，下次可续传）'
+    if 'changed' in results:
+        shutil.rmtree(part_dir, ignore_errors=True)
+        _remove_file(_parts_meta_path(out_path))
+        return False, 'RESOURCE_CHANGED'
     if 'norange' in results:
         # 服务器忽略 Range：放弃分段，清理后回退单流下载
         import shutil as _sh
         _sh.rmtree(part_dir, ignore_errors=True)
-        return _download_single(url, out_path, proxy, progress, stop, max_seconds)
+        return _download_single(url, out_path, proxy, progress, stop, max_seconds,
+                                etag=info.get('etag', ''),
+                                last_modified=info.get('last_modified', ''))
     if 'error' in results:
         return False, '分片下载失败（已保留分片，可重试续传）'
     # 严格校验每个分片大小
@@ -322,8 +352,9 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
     return True, out_path
 
 
-def _download_single(url, out_path, proxy, progress, stop, max_seconds):
-    meta = {'url': url, 'mode': 'single'}
+def _download_single(url, out_path, proxy, progress, stop, max_seconds,
+                     etag='', last_modified=''):
+    meta = {'url': url, 'mode': 'single', 'etag': etag or '', 'last_modified': last_modified or ''}
     old = _load_json_file(_parts_meta_path(out_path))
     if os.path.exists(out_path) and old != meta:
         _remove_file(out_path)  # 不是同一个资源，不能续传
@@ -334,6 +365,10 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds):
             '-o', out_path, '--progress-bar']
     if resume:
         args += ['-C', '-']
+        if etag and not str(etag).startswith('W/'):
+            args += ['-H', f'If-Range: {etag}']
+        elif last_modified:
+            args += ['-H', f'If-Range: {last_modified}']
     if proxy:
         args += ['-x', proxy]
     args.append(url)
@@ -364,7 +399,9 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds):
     if not ok and resume:
         # 服务器不支持续传：删掉半截文件重下一遍
         _remove_file(out_path)
-        return _download_single(url, out_path, proxy, progress, stop, max_seconds)
+        return _download_single(url, out_path, proxy, progress, stop, max_seconds,
+                                etag=info.get('etag', ''),
+                                last_modified=info.get('last_modified', ''))
     if ok:
         _remove_file(_parts_meta_path(out_path))
         return True, out_path
@@ -476,6 +513,19 @@ def parse_m3u8(text, base_url):
     return variants, segs
 
 
+def hls_digest(segs):
+    """对分片序列号/URI/密钥方式/密钥 URI/IV 规范化后取 SHA-256。"""
+    import hashlib
+    lines = []
+    for s in segs or []:
+        k = s.get('key') or {}
+        lines.append('|'.join([
+            str(s.get('seq', '')), s.get('uri', ''),
+            str(k.get('method', '')), str(k.get('uri', '')), str(k.get('iv') or ''),
+        ]))
+    return hashlib.sha256('\n'.join(lines).encode('utf-8')).hexdigest()
+
+
 def _aes_decrypt(data, key, iv):
     """AES-128-CBC 解密（PKCS7）。失败抛异常，绝不返回密文冒充明文。"""
     if not data or len(data) % 16 != 0:
@@ -522,9 +572,7 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
     if bad_methods:
         return False, f'不支持的 HLS 加密方式：{", ".join(sorted(bad_methods))}'
     part_dir = out_path + '.hls_parts'
-    import hashlib
-    digest = hashlib.sha256('\n'.join(x['uri'] for x in segs).encode('utf-8')).hexdigest()
-    hls_meta = {'url': url, 'count': total, 'digest': digest, 'mode': 'hls'}
+    hls_meta = {'url': url, 'count': total, 'digest': hls_digest(segs), 'mode': 'hls'}
     _prepare_parts_meta(out_path, part_dir, hls_meta)
     os.makedirs(part_dir, exist_ok=True)
     done = [0]

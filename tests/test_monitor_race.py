@@ -26,6 +26,9 @@ class DummyCore:
     def running(self):
         return self.running_flag
 
+    def current_token(self):
+        return self.token
+
 
 class MonitorRaceTest(unittest.TestCase):
     def make_app(self, node):

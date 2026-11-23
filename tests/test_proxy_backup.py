@@ -46,7 +46,8 @@ class ProxyBackupTest(unittest.TestCase):
              'ProxyOverride': None, 'AutoConfigURL': None}))
 
     def test_refuse_takeover_on_corrupt_backup(self):
-        json.dump({'junk': 'broken'}, open(self.core.PROXY_BACKUP, 'w', encoding='utf-8'))
+        with open(self.core.PROXY_BACKUP, 'w', encoding='utf-8') as f:
+            json.dump({'junk': 'broken'}, f)
         before = self.core.read_proxy_registry()
         self.assertFalse(self.core.set_system_proxy(23456))
         self.assertEqual(before, self.core.read_proxy_registry())

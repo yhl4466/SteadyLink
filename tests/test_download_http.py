@@ -78,6 +78,39 @@ class HttpRangeTest(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_fetch_chunk_detects_etag_change(self):
+        srv = RangeServer(self.data, 'range', etag_mode='change')
+        try:
+            info = dl.probe(srv.url)          # 第 1 次请求：ETag v1
+            part = os.path.join(self.tmp, 'p.part')
+            r = dl._fetch_chunk(srv.url, part, 0, 1023, None,
+                                threading.Event(), lambda n: None, retries=1,
+                                etag=info.get('etag', ''))
+            self.assertEqual(r, 'changed')    # 分片请求时服务端已变成 v2
+        finally:
+            srv.close()
+
+    def test_fetch_chunk_detects_ifrange_mismatch(self):
+        srv = RangeServer(self.data, 'range')
+        try:
+            part = os.path.join(self.tmp, 'p.part')
+            r = dl._fetch_chunk(srv.url, part, 0, 1023, None,
+                                threading.Event(), lambda n: None, retries=1,
+                                etag='"other"')
+            self.assertEqual(r, 'changed')
+        finally:
+            srv.close()
+
+    def test_download_recovers_after_resource_change(self):
+        srv = RangeServer(self.data, 'range', etag_mode='change')
+        try:
+            out = os.path.join(self.tmp, 'changed.bin')
+            ok, msg = dl.download(srv.url, out, threads=2, chunk=64 * 1024)
+            self.assertTrue(ok, msg)          # 检测到变化 -> 重新探测后重下一次
+            self.assertEqual(_read(out), self.data)
+        finally:
+            srv.close()
+
     def test_resume_ignores_parts_from_other_url(self):
         # 伪造别的 URL 留下的分片（内容错误），续传时必须被丢弃
         out = os.path.join(self.tmp, 'resume.bin')

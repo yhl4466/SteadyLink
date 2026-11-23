@@ -325,6 +325,10 @@ class Core:
         with self._lock:
             return self.proc is not None and self.proc.poll() is None
 
+    def current_token(self):
+        with self._lock:
+            return self._token
+
     def _stop_locked(self):
         p, self.proc = self.proc, None
         self.on_line = None

@@ -55,6 +55,18 @@ class ResumeMetaTest(unittest.TestCase):
         dl._prepare_parts_meta(self.out, self.part, dict(meta, digest=d2))
         self.assertFalse(os.path.isdir(self.part))
 
+    def test_hls_digest_covers_key_and_iv(self):
+        base = [{'uri': 'http://x/1.ts', 'seq': 0, 'key': {'method': 'AES-128', 'uri': 'http://x/k1', 'iv': '00'}},
+                {'uri': 'http://x/2.ts', 'seq': 1, 'key': {'method': 'AES-128', 'uri': 'http://x/k1', 'iv': '00'}}]
+        changed_key = [dict(base[0], key={'method': 'AES-128', 'uri': 'http://x/k2', 'iv': '00'}),
+                       dict(base[1], key={'method': 'AES-128', 'uri': 'http://x/k2', 'iv': '00'})]
+        changed_iv = [dict(base[0], key={'method': 'AES-128', 'uri': 'http://x/k1', 'iv': '01'}),
+                      dict(base[1], key={'method': 'AES-128', 'uri': 'http://x/k1', 'iv': '01'})]
+        d0 = dl.hls_digest(base)
+        self.assertNotEqual(d0, dl.hls_digest(changed_key))
+        self.assertNotEqual(d0, dl.hls_digest(changed_iv))
+        self.assertEqual(d0, dl.hls_digest([dict(x) for x in base]))
+
     def test_unknown_parts_without_meta_purged(self):
         os.makedirs(self.part, exist_ok=True)
         _write(os.path.join(self.part, '00000.part'), b'x')

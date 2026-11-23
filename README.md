@@ -100,7 +100,7 @@ python steadylink.py
 python tests/run_tests.py -v
 ```
 
-覆盖：核心启动令牌（过期线程不误杀新进程）、自动重连并发/停止、系统代理备份与恢复、在线时长口径、HTTP 分段校验与回退、HLS AES-128/错误密钥/不支持加密、续传资源身份（URL/大小/ETag/HLS 摘要）。
+覆盖：核心启动令牌（过期线程不误杀新进程）、自动重连并发/停止、系统代理备份与恢复、在线时长口径、HTTP 分段校验与回退、If-Range/ETag 变化检测、HLS AES-128/错误密钥/不支持加密、续传资源身份（URL/大小/ETag/密钥与 IV 参与的 HLS 摘要）。共 32 个用例。
 
 详见 [tests/README.md](tests/README.md)。
 
