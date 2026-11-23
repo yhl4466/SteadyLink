@@ -75,37 +75,86 @@ def human(n):
 
 
 def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
+    """下载一个分段；严格校验 206 状态、Content-Range 与长度。
+    返回 'ok' / 'norange'（服务器忽略 Range）/ 'error' / 'stopped'。"""
     need = end - start + 1
+    if os.path.exists(part) and os.path.getsize(part) > need:
+        try:
+            os.unlink(part)
+        except Exception:
+            pass
     have = os.path.getsize(part) if os.path.exists(part) else 0
     if have >= need:
-        return True
+        return 'ok'
     attempt = 0
     while have < need and attempt < retries:
         if stop.is_set():
-            return False
+            return 'stopped'
         attempt += 1
         tmp = part + '.tmp'
-        args = ['-L', '-r', f'{start + have}-{end}', '--max-time', '120', '-A', UA, '-o', tmp, '-w', '%{http_code}']
+        hdr = part + '.hdr'
+        args = ['-L', '-D', hdr, '-r', f'{start + have}-{end}', '--max-time', '120',
+                '-A', UA, '-o', tmp, '-w', '%{http_code}']
         if proxy:
             args += ['-x', proxy]
         try:
             r = _curl(args + [url], timeout=140)
+            code = (r.stdout or '').strip()
         except Exception:
-            r = None
-        add = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-        if add > 0:
-            with open(part, 'ab') as f, open(tmp, 'rb') as g:
-                f.write(g.read())
-            have = os.path.getsize(part)
-            on_bytes(add)
+            code = ''
+        head = ''
         try:
-            if os.path.exists(tmp):
+            head = open(hdr, encoding='utf-8', errors='replace').read()
+        except Exception:
+            pass
+        try:
+            os.unlink(hdr)
+        except Exception:
+            pass
+        add = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        if code == '200':
+            try:
                 os.unlink(tmp)
+            except Exception:
+                pass
+            return 'norange'
+        if code not in ('206',) or add <= 0:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            time.sleep(min(1 + attempt * 0.5, 6))
+            continue
+        cr = re.findall(r'Content-Range:\s*bytes\s+(\d+)-(\d+)/(\d+|\*)', head, re.I)
+        if not cr:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            time.sleep(1)
+            continue
+        cr_start, cr_end = int(cr[-1][0]), int(cr[-1][1])
+        if cr_start != start + have or cr_end != end:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            time.sleep(1)
+            continue
+        want = need - have
+        if add > want:
+            add = want
+        with open(part, 'ab') as f, open(tmp, 'rb') as g:
+            f.write(g.read(add))
+        have = os.path.getsize(part)
+        on_bytes(add)
+        try:
+            os.unlink(tmp)
         except Exception:
             pass
         if have < need:
             time.sleep(min(1 + attempt * 0.5, 6))
-    return have >= need
+    return 'ok' if have >= need else 'error'
 
 
 def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
@@ -168,15 +217,25 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
         part = os.path.join(part_dir, f'{i:05d}.part')
         return _fetch_chunk(url, part, s, e, proxy, stop, on_bytes)
 
-    ok_all = True
     with cf.ThreadPoolExecutor(max_workers=max(1, int(threads))) as ex:
         results = list(ex.map(work, chunks))
-    ok_all = all(results) and not stop.is_set()
 
     if progress:
         progress(done[0], size, 0)
-    if not ok_all:
-        return False, '下载中断（已保留分片，下次可续传）'
+    if stop.is_set() or 'stopped' in results:
+        return False, '已取消（已保留分片，下次可续传）'
+    if 'norange' in results:
+        # 服务器忽略 Range：放弃分段，清理后回退单流下载
+        import shutil as _sh
+        _sh.rmtree(part_dir, ignore_errors=True)
+        return _download_single(url, out_path, proxy, progress, stop, max_seconds)
+    if 'error' in results:
+        return False, '分片下载失败（已保留分片，可重试续传）'
+    # 严格校验每个分片大小
+    for i, st, en in chunks:
+        part = os.path.join(part_dir, f'{i:05d}.part')
+        if not os.path.exists(part) or os.path.getsize(part) != en - st + 1:
+            return False, f'分片校验失败（第 {i + 1} 段大小不符）'
 
     tmp_out = out_path + '.merging'
     with open(tmp_out, 'wb') as out:
@@ -332,16 +391,15 @@ def parse_m3u8(text, base_url):
 
 
 def _aes_decrypt(data, key, iv):
-    try:
-        from Crypto.Cipher import AES
-        c = AES.new(key, AES.MODE_CBC, iv)
-        out = c.decrypt(data)
-        pad = out[-1] if out else 0
-        if 1 <= pad <= 16:
-            out = out[:-pad]
-        return out
-    except Exception:
-        return data
+    """AES-128-CBC 解密（PKCS7）。失败抛异常，绝不返回密文冒充明文。"""
+    if not data or len(data) % 16 != 0:
+        raise ValueError('分片长度不是 16 的倍数，无法解密')
+    from Crypto.Cipher import AES
+    out = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+    pad = out[-1] if out else 0
+    if not 1 <= pad <= 16 or out[-pad:] != bytes([pad]) * pad:
+        raise ValueError('AES 解密 padding 校验失败（密钥或 IV 不正确）')
+    return out[:-pad]
 
 
 def _iv_for(seg, key_info):
@@ -373,20 +431,26 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
     if not segs:
         return False, '没有解析到 HLS 分片（可能是加密/直播流）'
     total = len(segs)
+    bad_methods = {seg['key']['method'].upper() for seg in segs
+                   if seg.get('key') and seg['key'].get('method', '').upper() not in ('AES-128',)}
+    if bad_methods:
+        return False, f'不支持的 HLS 加密方式：{", ".join(sorted(bad_methods))}'
     part_dir = out_path + '.hls_parts'
     os.makedirs(part_dir, exist_ok=True)
     done = [0]
     lock = threading.Lock()
     key_cache = {}
+    key_lock = threading.Lock()
 
     def get_key(k):
         if not k:
             return None
         u = k['uri']
-        if u not in key_cache:
-            _, kb = _fetch_bytes(u, proxy, timeout=30)
-            key_cache[u] = kb
-        return key_cache[u]
+        with key_lock:
+            if u not in key_cache:
+                _, kb = _fetch_bytes(u, proxy, timeout=30)
+                key_cache[u] = kb
+            return key_cache[u]
 
     def work(i):
         seg = segs[i]
@@ -399,27 +463,41 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
             return True
         for attempt in range(5):
             if stop.is_set():
-                return False
+                return 'stopped'
             c, b = _fetch_bytes(seg['uri'], proxy, timeout=60)
-            if b and c in ('200', '206', '0'):
+            if b and c in ('200', '206'):
                 if seg.get('key') and seg['key'].get('method', '').upper() == 'AES-128':
                     kb = get_key(seg['key'])
-                    if kb:
+                    if not kb:
+                        return 'decrypt_fail'
+                    try:
                         b = _aes_decrypt(b, kb, _iv_for(seg, seg['key']))
+                    except Exception as e:
+                        if log:
+                            log(f'HLS 分片解密失败：{e}')
+                        return 'decrypt_fail'
                 with open(part, 'wb') as f:
                     f.write(b)
                 with lock:
                     done[0] += 1
                     if progress:
                         progress(done[0], total, 0)
-                return True
+                return 'ok'
             time.sleep(1 + attempt)
-        return False
+        return 'error' 
 
     with cf.ThreadPoolExecutor(max_workers=max(1, int(threads))) as ex:
         results = list(ex.map(work, range(total)))
-    if not all(results):
+    if stop.is_set() or 'stopped' in results:
+        return False, '已取消（分片已保留，可重试续传）'
+    if 'decrypt_fail' in results:
+        return False, 'HLS 解密失败（密钥/IV 不匹配），未生成文件'
+    if 'error' in results:
         return False, '部分分片下载失败（已保留分片，可重试续传）'
+    for i in range(total):
+        pth = os.path.join(part_dir, f'{i:06d}.ts')
+        if not os.path.exists(pth) or os.path.getsize(pth) == 0:
+            return False, f'分片完整性校验失败（第 {i + 1} 片缺失）'
     tmp = out_path + '.ts.tmp'
     with open(tmp, 'wb') as out:
         for i in range(total):

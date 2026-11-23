@@ -67,6 +67,26 @@ REGION_MAP = [('United States', '美国'), ('Japan', '日本'), ('Korea', '韩�
               ('Hong Kong', '香港'), ('Taiwan', '台湾'), ('Malaysia', '马来西亚'),
               ('Netherlands', '荷兰'), ('Switzerland', '瑞士'), ('France', '法国')]
 INFO_WORDS = ('剩余流量', '距离下次', '套餐到期', '官网')
+CONN_HIST_FILE = os.path.join(HERE, '连接历史.json')
+
+
+def load_conn_hist():
+    try:
+        import json as _json
+        data = _json.load(open(CONN_HIST_FILE, encoding='utf-8'))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_conn_hist(hist):
+    import json as _json
+    try:
+        tmp = CONN_HIST_FILE + '.tmp'
+        _json.dump(hist, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+        os.replace(tmp, CONN_HIST_FILE)
+    except Exception:
+        pass
 
 
 def pretty_remark(rem):
@@ -102,6 +122,8 @@ class App:
             n.setdefault('source', 'manual')
         self.core = core.Core()
         self.usage = core.Usage()
+        self.conn_sess = None
+        self.conn_hist = load_conn_hist()
         self.q = queue.Queue()
         self.connected_link = None
         self.exit_ip = None
@@ -144,6 +166,7 @@ class App:
         self._setup_tray()
         self._poll_queue()
         self._tick()
+        self.root.after(600, self._proxy_recovery_check)
 
     # ---------------- UI ----------------
     def _style(self):
@@ -236,6 +259,7 @@ class App:
                  font=('Microsoft YaHei UI', 9), anchor='w', padx=10, pady=5).pack(side='left')
         tk.Label(sb, textvariable=self.meta_var, bg=CARD, fg='#718096',
                  font=('Microsoft YaHei UI', 9), anchor='e', padx=10, pady=5).pack(side='right')
+        ttk.Button(sb, text='📊 连接统计', command=self.show_conn_stats).pack(side='right', padx=6, pady=2)
 
         # ---- 日志卡片（底部，仿 v2rayN 运行日志）----
         logcard = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -1010,6 +1034,9 @@ class App:
             core.set_system_proxy(self.cfg['http_port'])
             self.connected_link = self.nodes[idx]['link']
             self.exit_ip = ip
+            self.conn_sess = {'node': node.get('remark'), 'link': node.get('link'),
+                              'start': time.time(), 'ip_start': ip, 'reconnects': 0,
+                              'recover_times': [], 'ip_changes': 0}
             self.nodes[idx]['ip'] = ip
             self.nodes[idx]['loc'] = loc
             self.nodes[idx]['lat'] = lat
@@ -1037,10 +1064,8 @@ class App:
         def loop():
             fails = 0
             while not stop.is_set():
-                for _ in range(30):
-                    if stop.is_set():
-                        return
-                    time.sleep(1)
+                if stop.wait(30):
+                    return
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
                 if stop.is_set():
                     return
@@ -1048,23 +1073,203 @@ class App:
                     if ip and self.exit_ip and ip != self.exit_ip:
                         self.log(f'⚠ 出口 IP 变了: {self.exit_ip} -> {ip}（Claude 风控风险）')
                         self.exit_ip = ip
+                        if self.conn_sess is not None:
+                            self.conn_sess['ip_changes'] = self.conn_sess.get('ip_changes', 0) + 1
                     if fails:
                         self.log(f'✓ 节点恢复  延迟 {lat}ms')
+                        if self.conn_sess is not None:
+                            self.conn_sess.setdefault('recover_times', []).append(30.0 * fails)
                     fails = 0
                     self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
                 else:
                     fails += 1
                     self.log(f'✗ 健康检查失败（{fails}/2）')
-                    if fails >= 2:
-                        fails = 0
-                        self.log('节点不行了：固定模式不会自动换节点，请手动选一个再连接')
-                        self.q.put(('status', '● 节点异常（未自动切换）'))
+                    if fails < 2:
+                        continue
+                    fails = 0
+                    if not self.cfg.get('auto_reconnect', True):
+                        self.log('节点异常：自动重连已关闭，请手动处理')
+                        self.q.put(('status', '● 节点异常（未自动重连）'))
+                        continue
+                    if stop.is_set():
+                        return
+                    self._attempt_recover(node, stop)
 
         self.monitor_thread = threading.Thread(target=loop, daemon=True)
         self.monitor_thread.start()
 
+    def _attempt_recover(self, node, stop):
+        """优先用原节点重连（保持出口 IP）；连续失败且允许时才切换节点。"""
+        self.q.put(('status', '● 节点异常，正在重连...'))
+        for attempt in (1, 2):
+            if stop.is_set():
+                return False
+            t0 = time.time()
+            self.log(f'尝试重连原节点（第 {attempt} 次）...')
+            self.core.stop()
+            if self.core.start(node, self.cfg,
+                               on_line=lambda line: self.q.put(('logline', line))):
+                ok, ip, loc, lat = core.health(self.cfg['http_port'])
+                if ok:
+                    dt = time.time() - t0
+                    self.log(f'✓ 重连成功，用时 {dt:.1f}s  出口 {loc} {ip}')
+                    if self.conn_sess is not None:
+                        self.conn_sess['reconnects'] = self.conn_sess.get('reconnects', 0) + 1
+                        self.conn_sess.setdefault('recover_times', []).append(dt)
+                    self.exit_ip = ip
+                    self._restart_access_tail()
+                    self._apply_tz()
+                    self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
+                    return True
+            time.sleep(3)
+        self.log('✗ 原节点重连失败')
+        if self.cfg.get('auto_failover'):
+            return self._failover(node, stop)
+        self.q.put(('status', '● 节点异常（未自动切换）'))
+        return False
+
+    def _failover(self, node, stop):
+        """仅当用户明确开启 auto_failover 时切换节点（会改变出口 IP）。"""
+        cands = []
+        for n in self.nodes:
+            if n.get('link') == node.get('link'):
+                continue
+            p = core.parse_node(n.get('link', ''))
+            if p and core.valid_node(p):
+                cands.append((n.get('lat') or 99999, n, p))
+        cands.sort(key=lambda x: x[0])
+        for _, n, p in cands[:3]:
+            if stop.is_set():
+                return False
+            self.log(f'自动切换节点 → {n["remark"][:30]} ...')
+            if self.core.start(p, self.cfg,
+                               on_line=lambda line: self.q.put(('logline', line))):
+                ok, ip, loc, lat = core.health(self.cfg['http_port'])
+                if ok:
+                    self.connected_link = n['link']
+                    self.exit_ip = ip
+                    n['ip'], n['loc'], n['lat'] = ip, loc, lat
+                    if self.conn_sess is not None:
+                        self.conn_sess['ip_changes'] = self.conn_sess.get('ip_changes', 0) + 1
+                        self.conn_sess['failover_to'] = n['remark']
+                    self.log(f'✓ 已切换节点 {n["remark"][:30]}  出口 {loc} {ip}（IP 已变化）')
+                    self._restart_access_tail()
+                    self._apply_tz()
+                    self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
+                    self.q.put(('refresh', None))
+                    return True
+            self.core.stop()
+        self.log('✗ 备用节点均连接失败，请手动选择')
+        self.q.put(('status', '● 节点异常（切换失败）'))
+        return False
+
+    def _close_conn_session(self):
+        sess, self.conn_sess = self.conn_sess, None
+        if not sess:
+            return
+        end = time.time()
+        st = sess.get('start') or end
+        rec = {'node': sess.get('node'), 'link': sess.get('link'),
+               'start': st, 'end': end, 'duration': max(0.0, end - st),
+               'reconnects': int(sess.get('reconnects', 0)),
+               'ip_changes': int(sess.get('ip_changes', 0)),
+               'recover_times': list(sess.get('recover_times') or []),
+               'failover_to': sess.get('failover_to'),
+               'start_str': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st)),
+               'end_str': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end))}
+        self.conn_hist.append(rec)
+        if len(self.conn_hist) > 500:
+            self.conn_hist = self.conn_hist[-500:]
+        save_conn_hist(self.conn_hist)
+
+    def _proxy_recovery_check(self):
+        try:
+            if core.recover_proxy_if_needed((self.cfg['http_port'],)):
+                self.log('检测到上次异常退出遗留的系统代理，已恢复为原设置')
+        except Exception:
+            pass
+
+    def show_conn_stats(self):
+        hist = self.conn_hist
+        win = tk.Toplevel(self.root)
+        win.title('连接统计 — 节点稳定性')
+        win.geometry('900x560')
+        win.configure(bg=BG)
+        win.transient(self.root)
+        top = tk.Frame(win, bg=CARD, padx=12, pady=8)
+        top.pack(fill='x')
+        tk.Label(top, text='节点稳定性统计', bg=CARD, fg='#1a202c',
+                 font=('Microsoft YaHei UI', 12, 'bold')).pack(side='left')
+        tk.Label(top, text=f'  共 {len(hist)} 条连接记录', bg=CARD, fg='#718096',
+                 font=('Microsoft YaHei UI', 9)).pack(side='left')
+
+        cols = ('node', 'sessions', 'uptime', 'drops', 'recover', 'ipchg', 'last')
+        heads = {'node': '节点', 'sessions': '会话数', 'uptime': '总在线',
+                 'drops': '断线次数', 'recover': '平均恢复', 'ipchg': 'IP 变化', 'last': '最近连接'}
+        widths = {'node': 240, 'sessions': 70, 'uptime': 110, 'drops': 80,
+                  'recover': 90, 'ipchg': 80, 'last': 160}
+        wrap = tk.Frame(win, bg=CARD, padx=8, pady=8)
+        wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+        tv = ttk.Treeview(wrap, columns=cols, show='headings')
+        for c in cols:
+            tv.heading(c, text=heads[c])
+            tv.column(c, width=widths[c], anchor='w' if c == 'node' else 'center')
+        vs = ttk.Scrollbar(wrap, orient='vertical', command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        tv.pack(side='left', fill='both', expand=True)
+        vs.pack(side='left', fill='y')
+
+        agg = {}
+        for r in hist:
+            name = r.get('node') or '未知'
+            a = agg.setdefault(name, {'sessions': 0, 'secs': 0.0, 'drops': 0,
+                                      'rec': [], 'ip': 0, 'last': ''})
+            a['sessions'] += 1
+            a['secs'] += float(r.get('duration') or 0)
+            a['drops'] += int(r.get('reconnects') or 0)
+            a['rec'] += [float(x) for x in (r.get('recover_times') or [])]
+            a['ip'] += int(r.get('ip_changes') or 0)
+            if (r.get('end_str') or '') > a['last']:
+                a['last'] = r.get('end_str') or ''
+
+        def fmt_dur(sec):
+            sec = int(sec)
+            if sec >= 3600:
+                return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
+            if sec >= 60:
+                return f'{sec // 60}m{sec % 60:02d}s'
+            return f'{sec}s'
+
+        for name in sorted(agg, key=lambda k: -agg[k]['secs']):
+            a = agg[name]
+            avg = f"{sum(a['rec']) / len(a['rec']):.1f}s" if a['rec'] else '—'
+            tv.insert('', 'end', values=(name, a['sessions'], fmt_dur(a['secs']),
+                                         a['drops'], avg, a['ip'], a['last']))
+
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill='x', padx=10, pady=(0, 10))
+        tk.Label(bar, text='记录保存在 连接历史.json；断线次数=健康检查失败后的重连次数',
+                 bg=BG, fg='#718096', font=('Microsoft YaHei UI', 8)).pack(side='left')
+
+        def open_file():
+            try:
+                os.startfile(CONN_HIST_FILE)
+            except Exception:
+                pass
+
+        def clear():
+            if not messagebox.askyesno('连接统计', '清空所有连接记录？', parent=win):
+                return
+            self.conn_hist = []
+            save_conn_hist([])
+            win.destroy()
+
+        ttk.Button(bar, text='打开记录文件', command=open_file).pack(side='right', padx=4)
+        ttk.Button(bar, text='清空记录', command=clear).pack(side='right')
+
     def disconnect(self, silent=False):
         self.monitor_stop.set()
+        self._close_conn_session()
         try:
             self.usage.poll(self.cfg)
             self.usage.snapshot()
@@ -1114,7 +1319,7 @@ class App:
         win.title('设置')
         win.transient(self.root)
         win.grab_set()
-        win.geometry('600x720')
+        win.geometry('620x880')
         win.configure(bg=BG)
         frm = ttk.Frame(win, padding=16)
         frm.pack(fill='both', expand=True)
@@ -1147,6 +1352,9 @@ class App:
         ttk.Checkbutton(frm, text='开机自启（登录后自动打开本工具）',
                         variable=auto_var).grid(row=8, column=0, columnspan=3, sticky='w', pady=2)
 
+        rec_var = tk.BooleanVar(value=bool(self.cfg.get('auto_reconnect', True)))
+        ttk.Checkbutton(frm, text='断线自动重连（优先原节点，保持出口 IP 不变）',
+                        variable=rec_var).grid(row=20, column=0, columnspan=3, sticky='w', pady=2)
         ip_var = tk.BooleanVar(value=bool(self.cfg.get('auto_ip_check', True)))
         ttk.Checkbutton(frm, text='连接后自动做 IP 体检（记录 IP 风险画像）',
                         variable=ip_var).grid(row=13, column=0, columnspan=3, sticky='w', pady=2)
@@ -1178,6 +1386,9 @@ class App:
         acc_var = tk.BooleanVar(value=bool(self.cfg.get('access_log', True)))
         ttk.Checkbutton(frm, text='记录访问日志（每个域名的路由明细，显示在运行日志里）',
                         variable=acc_var).grid(row=16, column=0, columnspan=3, sticky='w', pady=2)
+        insecure_var = tk.BooleanVar(value=bool(self.cfg.get('allow_insecure', False)))
+        ttk.Checkbutton(frm, text='允许不校验 TLS 证书（仅自签证书需要，会降低安全性）',
+                        variable=insecure_var).grid(row=18, column=0, columnspan=3, sticky='w', pady=2)
 
         def save():
             try:
@@ -1197,6 +1408,8 @@ class App:
                 self.cfg['auto_ip_check'] = bool(ip_var.get())
                 self.cfg['core_log_level'] = level_var.get()
                 self.cfg['access_log'] = bool(acc_var.get())
+                self.cfg['auto_reconnect'] = bool(rec_var.get())
+                self.cfg['allow_insecure'] = bool(insecure_var.get())
                 tray_wanted = bool(tray_var.get())
                 self.cfg['minimize_to_tray'] = tray_wanted
                 core.save_config(self.cfg)
@@ -1224,7 +1437,7 @@ class App:
         ttk.Button(shortcut_row, text='创建管理员模式',
                    command=lambda: self.create_shortcut(True)).pack(side='left', padx=4)
         ttk.Button(frm, text='保存', style='Primary.TButton', command=save).grid(
-            row=17, column=2, sticky='e', pady=12)
+            row=21, column=2, sticky='e', pady=12)
 
     # ---------------- 托盘 / 窗口 ----------------
     def _tray_image(self):

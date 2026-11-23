@@ -1,5 +1,5 @@
 """迷你 v2rayN 的核心模块：节点解析、Xray 配置、核心启停、系统代理、测速、用量统计。"""
-import base64, ctypes, json, os, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, winreg
+import base64, ctypes, json, os, re, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, winreg
 import concurrent.futures as cf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
     'auto_ip_check': True,
     'core_log_level': 'info',
     'access_log': True,
+    'allow_insecure': False,
+    'auto_reconnect': True,
 }
 
 os.makedirs(CFG_DIR, exist_ok=True)
@@ -116,6 +118,50 @@ def curl(args, timeout=180):
 
 
 # ---------------- 节点解析 ----------------
+def _b64d(s):
+    s = (s or '').strip().replace('-', '+').replace('_', '/')
+    s += '=' * (-len(s) % 4)
+    try:
+        return base64.b64decode(s).decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+
+def parse_ss(link):
+    """解析 Shadowsocks 链接，兼容 SIP002 与旧式整串 base64。"""
+    u = urllib.parse.urlparse(link)
+    frag = urllib.parse.unquote(u.fragment)
+    host, port = u.hostname, u.port
+    userinfo = u.username
+    method = pw = ''
+    if userinfo and host and port:
+        ui = urllib.parse.unquote(userinfo)
+        pw_url = u.password
+        if pw_url is not None:
+            # SIP002：ss://method:password@host:port（密码可能被 URL 编码）
+            method = ui.split(':', 1)[0]
+            pw = urllib.parse.unquote(pw_url)
+        elif ':' in ui:
+            method, _, pw = ui.partition(':')
+        else:
+            dec = _b64d(ui)
+            method, _, pw = dec.partition(':')
+    else:
+        raw = link[5:].split('#')[0].split('?')[0].strip()
+        dec = _b64d(raw)
+        m = re.match(r'^([^:]+):(.*)@(.+):(\d+)$', dec, re.S)
+        if not m:
+            return None
+        method, pw, host, port = m.group(1), m.group(2), m.group(3), int(m.group(4))
+    if not method or not pw or not host or not port:
+        return None
+    return {'link': link, 'ct': 3, 'addr': host, 'port': port, 'uuid': pw,
+            'security': method, 'net': 'tcp', 'sec': 'none', 'sni': '', 'fp': '', 'pbk': '',
+            'sid': '', 'spx': '', 'flow': '', 'host': '', 'path': '', 'alpn': '',
+            'allow': False,
+            'remark': frag or f'{host}:{port}', 'proto': 'ss'}
+
+
 def parse_node(link):
     link = (link or '').strip()
     if link.startswith('vless://'):
@@ -154,18 +200,11 @@ def parse_node(link):
                 'uuid': urllib.parse.unquote(u.username or ''), 'net': g('type', 'tcp'),
                 'sec': 'tls', 'sni': g('sni'), 'fp': g('fp'), 'pbk': '', 'sid': '', 'spx': '',
                 'flow': '', 'host': g('host'), 'path': g('path'), 'alpn': g('alpn'),
-                'allow': True, 'remark': urllib.parse.unquote(u.fragment) or f"{u.hostname}:{u.port}",
+                'allow': g('allowInsecure') in ('1', 'true', 'yes'),
+                'remark': urllib.parse.unquote(u.fragment) or f"{u.hostname}:{u.port}",
                 'proto': 'trojan'}
     if link.startswith('ss://'):
-        u = urllib.parse.urlparse(link)
-        b = u.netloc.split('@')[0]
-        b += '=' * (-len(b) % 4)
-        mp = base64.urlsafe_b64decode(b).decode('utf-8', 'replace')
-        method, _, pw = mp.partition(':')
-        return {'link': link, 'ct': 3, 'addr': u.hostname, 'port': u.port, 'uuid': pw,
-                'security': method, 'net': 'tcp', 'sec': 'none', 'sni': '', 'fp': '', 'pbk': '',
-                'sid': '', 'spx': '', 'flow': '', 'host': '', 'path': '', 'alpn': '', 'allow': False,
-                'remark': urllib.parse.unquote(u.fragment) or f"{u.hostname}:{u.port}", 'proto': 'ss'}
+        return parse_ss(link)
     return None
 
 
@@ -181,7 +220,7 @@ def valid_node(n):
     return True
 
 
-def stream_settings(n):
+def stream_settings(n, allow_insecure=False):
     ss = {'network': n['net']}
     if n['net'] == 'ws':
         ss['wsSettings'] = {'path': n.get('path') or '/',
@@ -202,7 +241,8 @@ def stream_settings(n):
         ss['realitySettings'] = rs
     elif n.get('sec') == 'tls':
         ss['security'] = 'tls'
-        ts = {'serverName': n['sni'] or n.get('host') or n['addr'], 'allowInsecure': bool(n.get('allow'))}
+        ts = {'serverName': n['sni'] or n.get('host') or n['addr'],
+              'allowInsecure': bool(n.get('allow') or allow_insecure)}
         if n.get('alpn'):
             ts['alpn'] = [a for a in n['alpn'].replace(',', ' ').split() if a]
         if n.get('fp'):
@@ -213,8 +253,8 @@ def stream_settings(n):
     return ss
 
 
-def outbound(n, tag='proxy'):
-    o = {'protocol': '', 'settings': {}, 'streamSettings': stream_settings(n), 'tag': tag}
+def outbound(n, tag='proxy', allow_insecure=False):
+    o = {'protocol': '', 'settings': {}, 'streamSettings': stream_settings(n, allow_insecure), 'tag': tag}
     if n['ct'] == 5:
         o['protocol'] = 'vless'
         user = {'id': n['uuid'], 'encryption': 'none'}
@@ -237,8 +277,9 @@ def outbound(n, tag='proxy'):
     return o
 
 
-def build_config(n, http_port, socks_port, stats_port, log_level='warning', access_log=None):
-    ob = outbound(n, 'proxy')
+def build_config(n, http_port, socks_port, stats_port, log_level='warning', access_log=None,
+                 allow_insecure=False):
+    ob = outbound(n, 'proxy', allow_insecure)
     if not ob:
         return None
     log_cfg = {'loglevel': log_level or 'warning', 'timestamp': True}
@@ -283,25 +324,39 @@ class Core:
         self.on_line = on_line
         access_path = os.path.join(CFG_DIR, 'access.log') if cfg.get('access_log') else None
         c = build_config(node, cfg['http_port'], cfg['socks_port'], cfg['stats_port'],
-                         log_level=cfg.get('core_log_level', 'info'), access_log=access_path)
+                         log_level=cfg.get('core_log_level', 'info'), access_log=access_path,
+                         allow_insecure=bool(cfg.get('allow_insecure')))
         if not c:
             return False
         json.dump(c, open(self.cfg_path, 'w', encoding='utf-8'), ensure_ascii=False)
-        self.proc = subprocess.Popen([CORE, 'run', '-c', self.cfg_path],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, creationflags=CREATE,
-                                     errors='replace')
+        try:
+            self.proc = subprocess.Popen([CORE, 'run', '-c', self.cfg_path],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, bufsize=1, creationflags=CREATE,
+                                         errors='replace')
+        except Exception as e:
+            self.proc = None
+            self.on_line = None
+            try:
+                if self.on_line:
+                    self.on_line(f'核心启动异常：{e}')
+            except Exception:
+                pass
+            return False
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
         deadline = time.time() + 10
         while time.time() < deadline:
             if self.proc.poll() is not None:
+                self.stop()
                 return False
             try:
                 with socket.create_connection(('127.0.0.1', cfg['http_port']), timeout=0.3):
                     return True
             except OSError:
                 time.sleep(0.05)
+        # 启动超时：确保不留残余进程
+        self.stop()
         return False
 
     def _read_stdout(self):
@@ -336,20 +391,132 @@ class Core:
         self._reader = None
 
 # ---------------- 系统代理 ----------------
-def set_system_proxy(port):
+PROXY_BACKUP = os.path.join(CFG_DIR, 'proxy_backup.json')
+PROXY_NAMES = ('ProxyEnable', 'ProxyServer', 'ProxyOverride', 'AutoConfigURL')
+
+
+def _proxy_refresh():
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_ALL_ACCESS) as k:
-            if port is None:
-                winreg.SetValueEx(k, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
-            else:
-                winreg.SetValueEx(k, 'ProxyServer', 0, winreg.REG_SZ, f'127.0.0.1:{port}')
-                winreg.SetValueEx(k, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
         w = ctypes.windll.wininet
         w.InternetSetOptionW(0, 39, 0, 0)
         w.InternetSetOptionW(0, 37, 0, 0)
+    except Exception:
+        pass
+
+
+def read_proxy_registry():
+    """读取当前系统代理完整配置（值 + 类型，缺失为 None）。"""
+    data = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_READ) as k:
+            for name in PROXY_NAMES:
+                try:
+                    v, t = winreg.QueryValueEx(k, name)
+                    data[name] = {'value': v, 'type': t}
+                except FileNotFoundError:
+                    data[name] = None
+    except Exception:
+        return {}
+    return data
+
+
+def _write_proxy_registry(data):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_ALL_ACCESS) as k:
+        for name in PROXY_NAMES:
+            item = data.get(name)
+            if item is None:
+                try:
+                    winreg.DeleteValue(k, name)
+                except FileNotFoundError:
+                    pass
+            else:
+                winreg.SetValueEx(k, name, 0, item.get('type') or winreg.REG_SZ, item.get('value'))
+    _proxy_refresh()
+
+
+def save_proxy_state(force=False):
+    """连接前保存原始系统代理（只在没有备份时保存）。"""
+    if os.path.exists(PROXY_BACKUP) and not force:
+        return False
+    data = read_proxy_registry()
+    if not data:
+        return False
+    try:
+        tmp = PROXY_BACKUP + '.tmp'
+        json.dump(data, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+        os.replace(tmp, PROXY_BACKUP)
         return True
     except Exception:
         return False
+
+
+def has_proxy_backup():
+    return os.path.exists(PROXY_BACKUP)
+
+
+def _disable_proxy():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
+        _proxy_refresh()
+        return True
+    except Exception:
+        return False
+
+
+def restore_proxy_state():
+    """恢复连接前的系统代理；没有备份则单纯关闭。"""
+    if not os.path.exists(PROXY_BACKUP):
+        return _disable_proxy()
+    try:
+        data = json.load(open(PROXY_BACKUP, encoding='utf-8'))
+    except Exception:
+        data = None
+    if not data:
+        _disable_proxy()
+    else:
+        try:
+            _write_proxy_registry(data)
+        except Exception:
+            return False
+    try:
+        os.unlink(PROXY_BACKUP)
+    except Exception:
+        pass
+    return True
+
+
+def set_system_proxy(port):
+    if port is None:
+        return restore_proxy_state()
+    save_proxy_state()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, 'ProxyServer', 0, winreg.REG_SZ, f'127.0.0.1:{port}')
+            winreg.SetValueEx(k, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
+            try:
+                winreg.DeleteValue(k, 'AutoConfigURL')
+            except FileNotFoundError:
+                pass
+        _proxy_refresh()
+        return True
+    except Exception:
+        return False
+
+
+def recover_proxy_if_needed(our_ports=()):
+    """上次异常退出留下的代理设置：如果指向本程序端口，恢复原状态。"""
+    if not has_proxy_backup():
+        return False
+    try:
+        st = read_proxy_registry()
+        enabled = (st.get('ProxyEnable') or {}).get('value')
+        server = str((st.get('ProxyServer') or {}).get('value') or '')
+        if enabled and any(f':{p}' in server for p in our_ports):
+            return restore_proxy_state()
+    except Exception:
+        pass
+    return False
 
 
 def system_proxy_enabled():
