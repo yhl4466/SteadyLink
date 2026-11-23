@@ -59,7 +59,16 @@ def probe(url, proxy=None, timeout=25):
         fname = sanitize(urllib.parse.unquote(m.group(1).strip().strip('"')))
     if not fname:
         fname = filename_from_url(url) or 'download.bin'
-    return {'url': url, 'error': None, 'size': size, 'range': rng, 'ctype': ctype, 'filename': fname}
+    etag = ''
+    m = re.search(r'ETag:\s*([^\r\n]+)', hdr, re.I)
+    if m:
+        etag = m.group(1).strip()
+    lastmod = ''
+    m = re.search(r'Last-Modified:\s*([^\r\n]+)', hdr, re.I)
+    if m:
+        lastmod = m.group(1).strip()
+    return {'url': url, 'error': None, 'size': size, 'range': rng, 'ctype': ctype,
+            'filename': fname, 'etag': etag, 'last_modified': lastmod}
 
 
 def human(n):
@@ -218,13 +227,17 @@ def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
     if info.get('error'):
         return False, f"探测失败：{info['error']}"
     if info.get('range') is not None and info.get('size') and info['range'] and threads > 1:
-        return _download_segments(url, out_path, info['size'], proxy, threads, chunk, progress, stop, max_seconds)
+        return _download_segments(url, out_path, info['size'], proxy, threads, chunk, progress,
+                                  stop, max_seconds, etag=info.get('etag', ''),
+                                  last_modified=info.get('last_modified', ''))
     return _download_single(url, out_path, proxy, progress, stop, max_seconds)
 
 
-def _download_segments(url, out_path, size, proxy, threads, chunk, progress, stop, max_seconds):
+def _download_segments(url, out_path, size, proxy, threads, chunk, progress, stop, max_seconds,
+                       etag='', last_modified=''):
     part_dir = out_path + '.parts'
-    meta = {'url': url, 'size': size, 'chunk': chunk, 'mode': 'segments'}
+    meta = {'url': url, 'size': size, 'chunk': chunk, 'mode': 'segments',
+            'etag': etag or '', 'last_modified': last_modified or ''}
     _prepare_parts_meta(out_path, part_dir, meta)
     os.makedirs(part_dir, exist_ok=True)
     lock = threading.Lock()
@@ -503,8 +516,9 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
     if bad_methods:
         return False, f'不支持的 HLS 加密方式：{", ".join(sorted(bad_methods))}'
     part_dir = out_path + '.hls_parts'
-    hls_meta = {'url': url, 'count': total, 'first': segs[0]['uri'], 'last': segs[-1]['uri'],
-                'mode': 'hls'}
+    import hashlib
+    digest = hashlib.sha256('\n'.join(x['uri'] for x in segs).encode('utf-8')).hexdigest()
+    hls_meta = {'url': url, 'count': total, 'digest': digest, 'mode': 'hls'}
     _prepare_parts_meta(out_path, part_dir, hls_meta)
     os.makedirs(part_dir, exist_ok=True)
     done = [0]

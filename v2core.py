@@ -310,68 +310,22 @@ def build_config(n, http_port, socks_port, stats_port, log_level='warning', acce
 
 # ---------------- 核心管理 ----------------
 class Core:
+    """Xray 进程管理。start() 返回 token；stop(token) 只停止该 token 的进程，
+    避免过期线程误杀新连接启动的核心。"""
+
     def __init__(self):
         self.proc = None
         self.cfg_path = os.path.join(CFG_DIR, 'active.json')
         self.on_line = None
         self._reader = None
+        self._lock = threading.RLock()
+        self._token = 0
 
     def running(self):
-        return self.proc is not None and self.proc.poll() is None
+        with self._lock:
+            return self.proc is not None and self.proc.poll() is None
 
-    def start(self, node, cfg, on_line=None):
-        self.stop()
-        self.on_line = on_line
-        access_path = os.path.join(CFG_DIR, 'access.log') if cfg.get('access_log') else None
-        c = build_config(node, cfg['http_port'], cfg['socks_port'], cfg['stats_port'],
-                         log_level=cfg.get('core_log_level', 'info'), access_log=access_path,
-                         allow_insecure=bool(cfg.get('allow_insecure')))
-        if not c:
-            return False
-        json.dump(c, open(self.cfg_path, 'w', encoding='utf-8'), ensure_ascii=False)
-        try:
-            self.proc = subprocess.Popen([CORE, 'run', '-c', self.cfg_path],
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, bufsize=1, creationflags=CREATE,
-                                         errors='replace')
-        except Exception as e:
-            self.proc = None
-            self.on_line = None
-            try:
-                if self.on_line:
-                    self.on_line(f'核心启动异常：{e}')
-            except Exception:
-                pass
-            return False
-        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
-        self._reader.start()
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                self.stop()
-                return False
-            try:
-                with socket.create_connection(('127.0.0.1', cfg['http_port']), timeout=0.3):
-                    return True
-            except OSError:
-                time.sleep(0.05)
-        # 启动超时：确保不留残余进程
-        self.stop()
-        return False
-
-    def _read_stdout(self):
-        proc = self.proc
-        if not proc or not proc.stdout:
-            return
-        try:
-            for line in proc.stdout:
-                line = (line or '').rstrip()
-                if line and self.on_line:
-                    self.on_line(line)
-        except Exception:
-            pass
-
-    def stop(self):
+    def _stop_locked(self):
         p, self.proc = self.proc, None
         self.on_line = None
         if p:
@@ -389,6 +343,80 @@ class Core:
             except Exception:
                 pass
         self._reader = None
+
+    def start(self, node, cfg, on_line=None):
+        """启动核心；成功返回 token(>0)，失败返回 0。"""
+        with self._lock:
+            self._stop_locked()
+            self._token += 1
+            token = self._token
+            self.on_line = on_line
+            access_path = os.path.join(CFG_DIR, 'access.log') if cfg.get('access_log') else None
+            c = build_config(node, cfg['http_port'], cfg['socks_port'], cfg['stats_port'],
+                             log_level=cfg.get('core_log_level', 'info'), access_log=access_path,
+                             allow_insecure=bool(cfg.get('allow_insecure')))
+            if not c:
+                return 0
+            try:
+                json.dump(c, open(self.cfg_path, 'w', encoding='utf-8'), ensure_ascii=False)
+                p = subprocess.Popen([CORE, 'run', '-c', self.cfg_path],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, creationflags=CREATE,
+                                     errors='replace')
+            except Exception as e:
+                self.on_line = None
+                try:
+                    if on_line:
+                        on_line(f'核心启动异常：{e}')
+                except Exception:
+                    pass
+                return 0
+            self.proc = p
+        self._reader = threading.Thread(target=self._read_stdout, args=(p, token), daemon=True)
+        self._reader.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with self._lock:
+                if self._token != token or self.proc is not p:
+                    return 0          # 已被新的连接接管，不能动别人的进程
+                if p.poll() is not None:
+                    self._stop_locked()
+                    return 0
+            try:
+                with socket.create_connection(('127.0.0.1', cfg['http_port']), timeout=0.3):
+                    with self._lock:
+                        if self._token != token or self.proc is not p:
+                            return 0
+                    return token
+            except OSError:
+                time.sleep(0.05)
+        with self._lock:
+            if self._token == token and self.proc is p:
+                self._stop_locked()
+        return 0
+
+    def _read_stdout(self, proc, token):
+        if not proc or not proc.stdout:
+            return
+        try:
+            for line in proc.stdout:
+                line = (line or '').rstrip()
+                if line and self.on_line:
+                    with self._lock:
+                        if self._token != token:
+                            return
+                    self.on_line(line)
+        except Exception:
+            pass
+
+    def stop(self, token=None):
+        """无条件停止（token=None），或仅当 token 仍是当前值时停止。"""
+        with self._lock:
+            if token is not None and token != self._token:
+                return False
+            self._token += 1
+            self._stop_locked()
+            return True
 
 # ---------------- 系统代理 ----------------
 PROXY_BACKUP = os.path.join(CFG_DIR, 'proxy_backup.json')
@@ -450,6 +478,30 @@ def save_proxy_state(force=False):
         return False
 
 
+def _valid_proxy_backup(data):
+    if not isinstance(data, dict) or not data:
+        return False
+    for name in PROXY_NAMES:
+        if name not in data:
+            return False
+        item = data[name]
+        if item is None:
+            continue
+        if not isinstance(item, dict) or 'value' not in item:
+            return False
+        if item.get('type') not in (winreg.REG_SZ, winreg.REG_DWORD):
+            return False
+    return True
+
+
+def load_proxy_backup():
+    try:
+        data = json.load(open(PROXY_BACKUP, encoding='utf-8'))
+    except Exception:
+        return None
+    return data if _valid_proxy_backup(data) else None
+
+
 def has_proxy_backup():
     return os.path.exists(PROXY_BACKUP)
 
@@ -468,12 +520,15 @@ def restore_proxy_state():
     """恢复连接前的系统代理；没有备份则单纯关闭。"""
     if not os.path.exists(PROXY_BACKUP):
         return _disable_proxy()
-    try:
-        data = json.load(open(PROXY_BACKUP, encoding='utf-8'))
-    except Exception:
-        data = None
-    if not data:
+    data = load_proxy_backup()
+    if data is None:
+        # 备份损坏：无法还原，至少关闭代理避免断网
         _disable_proxy()
+        try:
+            os.unlink(PROXY_BACKUP)
+        except Exception:
+            pass
+        return False
     else:
         try:
             _write_proxy_registry(data)
@@ -491,7 +546,7 @@ def set_system_proxy(port):
         return restore_proxy_state()
     # 备份失败则拒绝接管系统代理，避免退出后无法还原
     saved = save_proxy_state()
-    if not saved and not os.path.exists(PROXY_BACKUP):
+    if not saved and load_proxy_backup() is None:
         return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:

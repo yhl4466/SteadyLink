@@ -1025,31 +1025,35 @@ class App:
 
         def run():
             self.log(f"正在连接 {node['remark'][:40]} ({node['addr']}:{node['port']}) ...")
-            if not self.core.start(node, self.cfg,
-                                   on_line=lambda line: self.q.put(('logline', line))):
+            token = self.core.start(node, self.cfg,
+                                    on_line=lambda line: self.q.put(('logline', line)))
+            if not token:
                 self.log('核心启动失败（节点配置或端口问题）')
                 self.q.put(('status', '● 连接失败'))
                 return
             if self.conn_gen != gen:
-                self.core.stop()
+                self.core.stop(token)
                 return
             ok, ip, loc, lat = core.health(self.cfg['http_port'])
             if self.conn_gen != gen:
-                self.core.stop()
+                self.core.stop(token)
                 return
             if not ok:
                 self.log('健康检查失败：节点不通')
-                self.core.stop()
+                self.core.stop(token)
                 self.q.put(('status', '● 连接失败'))
                 return
-            core.set_system_proxy(self.cfg['http_port'])
+            proxy_ok = core.set_system_proxy(self.cfg['http_port'])
+            if not proxy_ok:
+                self.log('⚠ 系统代理设置失败（备份无效或注册表写入被拒绝），当前只有浏览器之外的程序可手动用 10901')
             self.connected_link = self.nodes[idx]['link']
             self.exit_ip = ip
             self.active_node = node
             self.conn_sess = {'node': node.get('remark'), 'link': node.get('link'),
                               'start': time.time(), 'ip_start': ip, 'reconnects': 0,
                               'recover_times': [], 'ip_changes': 0, 'online': 0.0,
-                              'last_ok': None, 'failures': 0, 'failovers': 0}
+                              'check_ok': False, 'check_time': None,
+                              'failures': 0, 'failovers': 0}
             self.nodes[idx]['ip'] = ip
             self.nodes[idx]['loc'] = loc
             self.nodes[idx]['lat'] = lat
@@ -1057,7 +1061,8 @@ class App:
             self.save()
             self.log(f"✓ 已连接  出口 {loc} {ip}  延迟 {lat}ms")
             self.log('出口 IP 已固定，之后不要频繁换节点（防 Claude 风控）')
-            self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
+            self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'
+                        + ('' if proxy_ok else '（系统代理未生效）')))
             self.q.put(('refresh', None))
             self._restart_access_tail()
             self._apply_tz()
@@ -1066,6 +1071,20 @@ class App:
             self._start_monitor(node)
 
         threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _account_check(sess, ok, now):
+        if sess is None:
+            return
+        if ok:
+            if sess.get('check_ok') and sess.get('check_time'):
+                sess['online'] = sess.get('online', 0.0) + min(now - sess['check_time'], 60)
+            sess['check_ok'] = True
+            sess['check_time'] = now
+        else:
+            sess['failures'] = sess.get('failures', 0) + 1
+            sess['check_ok'] = False
+            sess['check_time'] = now
 
     def _start_monitor(self, node):
         self.active_node = self.active_node or node
@@ -1086,10 +1105,7 @@ class App:
                 sess = self.conn_sess
                 now = time.time()
                 if ok:
-                    if sess is not None:
-                        if sess.get('last_ok'):
-                            sess['online'] = sess.get('online', 0.0) + min(now - sess['last_ok'], 90)
-                        sess['last_ok'] = now
+                    self._account_check(sess, True, now)
                     if ip and self.exit_ip and ip != self.exit_ip:
                         self.log(f'⚠ 出口 IP 变了: {self.exit_ip} -> {ip}（Claude 风控风险）')
                         self.exit_ip = ip
@@ -1103,8 +1119,7 @@ class App:
                     self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
                 else:
                     fails += 1
-                    if sess is not None:
-                        sess['failures'] = sess.get('failures', 0) + 1
+                    self._account_check(sess, False, now)
                     self.log(f'✗ 健康检查失败（{fails}/2）')
                     if fails < 2:
                         continue
@@ -1135,14 +1150,15 @@ class App:
             self.core.stop()
             if stop.is_set() or self.conn_gen != gen:
                 return False
-            if self.core.start(node, self.cfg,
-                               on_line=lambda line: self.q.put(('logline', line))):
+            token = self.core.start(node, self.cfg,
+                                    on_line=lambda line: self.q.put(('logline', line)))
+            if token:
                 if stop.is_set() or self.conn_gen != gen:
-                    self.core.stop()
+                    self.core.stop(token)
                     return False
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
                 if stop.is_set() or self.conn_gen != gen:
-                    self.core.stop()
+                    self.core.stop(token)
                     return False
                 if ok:
                     dt = time.time() - t0
@@ -1151,7 +1167,8 @@ class App:
                     if sess is not None:
                         sess['reconnects'] = sess.get('reconnects', 0) + 1
                         sess.setdefault('recover_times', []).append(dt)
-                        sess['last_ok'] = time.time()
+                        sess['check_ok'] = True
+                        sess['check_time'] = time.time()
                     self.exit_ip = ip
                     self._restart_access_tail()
                     self._apply_tz()
@@ -1180,14 +1197,15 @@ class App:
             if stop.is_set() or self.conn_gen != gen:
                 return False
             self.log(f'自动切换节点 → {n["remark"][:30]} ...')
-            if self.core.start(p, self.cfg,
-                               on_line=lambda line: self.q.put(('logline', line))):
+            token = self.core.start(p, self.cfg,
+                                    on_line=lambda line: self.q.put(('logline', line)))
+            if token:
                 if stop.is_set() or self.conn_gen != gen:
-                    self.core.stop()
+                    self.core.stop(token)
                     return False
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
                 if stop.is_set() or self.conn_gen != gen:
-                    self.core.stop()
+                    self.core.stop(token)
                     return False
                 if ok:
                     self.active_node = p
@@ -1198,7 +1216,8 @@ class App:
                     if sess is not None:
                         sess['failovers'] = sess.get('failovers', 0) + 1
                         sess['ip_changes'] = sess.get('ip_changes', 0) + 1
-                        sess['last_ok'] = time.time()
+                        sess['check_ok'] = True
+                        sess['check_time'] = time.time()
                         sess['failover_to'] = n['remark']
                     self.log(f'✓ 已切换节点 {n["remark"][:30]}  出口 {loc} {ip}（IP 已变化）')
                     self._restart_access_tail()
@@ -1218,9 +1237,8 @@ class App:
         end = time.time()
         st = sess.get('start') or end
         online = float(sess.get('online') or 0.0)
-        last_ok = sess.get('last_ok')
-        if last_ok:
-            online += min(max(0.0, end - last_ok), 90)
+        if sess.get('check_ok') and sess.get('check_time'):
+            online += min(max(0.0, end - sess['check_time']), 60)
         rec = {'node': sess.get('node'), 'link': sess.get('link'),
                'start': st, 'end': end, 'duration': max(0.0, end - st),
                'online': round(online, 1),
@@ -1341,7 +1359,11 @@ class App:
         except Exception:
             pass
         self._restore_tz()
-        core.set_system_proxy(None)
+        if not core.set_system_proxy(None):
+            try:
+                self.log('⚠ 系统代理还原失败（备份可能损坏），已尽可能关闭代理')
+            except Exception:
+                pass
         self.connected_link = None
         self.exit_ip = None
         self.q.put(('status', '● 未连接'))
