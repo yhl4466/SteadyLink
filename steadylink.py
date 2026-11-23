@@ -124,6 +124,8 @@ class App:
         self.usage = core.Usage()
         self.conn_sess = None
         self.conn_hist = load_conn_hist()
+        self.active_node = None
+        self.conn_gen = 0
         self.q = queue.Queue()
         self.connected_link = None
         self.exit_ip = None
@@ -1018,6 +1020,9 @@ class App:
         if self.core.running():
             self.disconnect(silent=True)
 
+        self.conn_gen += 1
+        gen = self.conn_gen
+
         def run():
             self.log(f"正在连接 {node['remark'][:40]} ({node['addr']}:{node['port']}) ...")
             if not self.core.start(node, self.cfg,
@@ -1025,7 +1030,13 @@ class App:
                 self.log('核心启动失败（节点配置或端口问题）')
                 self.q.put(('status', '● 连接失败'))
                 return
+            if self.conn_gen != gen:
+                self.core.stop()
+                return
             ok, ip, loc, lat = core.health(self.cfg['http_port'])
+            if self.conn_gen != gen:
+                self.core.stop()
+                return
             if not ok:
                 self.log('健康检查失败：节点不通')
                 self.core.stop()
@@ -1034,9 +1045,11 @@ class App:
             core.set_system_proxy(self.cfg['http_port'])
             self.connected_link = self.nodes[idx]['link']
             self.exit_ip = ip
+            self.active_node = node
             self.conn_sess = {'node': node.get('remark'), 'link': node.get('link'),
                               'start': time.time(), 'ip_start': ip, 'reconnects': 0,
-                              'recover_times': [], 'ip_changes': 0}
+                              'recover_times': [], 'ip_changes': 0, 'online': 0.0,
+                              'last_ok': None, 'failures': 0, 'failovers': 0}
             self.nodes[idx]['ip'] = ip
             self.nodes[idx]['loc'] = loc
             self.nodes[idx]['lat'] = lat
@@ -1055,6 +1068,7 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def _start_monitor(self, node):
+        self.active_node = self.active_node or node
         self.monitor_stop.set()
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=2)
@@ -1069,20 +1083,28 @@ class App:
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
                 if stop.is_set():
                     return
+                sess = self.conn_sess
+                now = time.time()
                 if ok:
+                    if sess is not None:
+                        if sess.get('last_ok'):
+                            sess['online'] = sess.get('online', 0.0) + min(now - sess['last_ok'], 90)
+                        sess['last_ok'] = now
                     if ip and self.exit_ip and ip != self.exit_ip:
                         self.log(f'⚠ 出口 IP 变了: {self.exit_ip} -> {ip}（Claude 风控风险）')
                         self.exit_ip = ip
-                        if self.conn_sess is not None:
-                            self.conn_sess['ip_changes'] = self.conn_sess.get('ip_changes', 0) + 1
+                        if sess is not None:
+                            sess['ip_changes'] = sess.get('ip_changes', 0) + 1
                     if fails:
                         self.log(f'✓ 节点恢复  延迟 {lat}ms')
-                        if self.conn_sess is not None:
-                            self.conn_sess.setdefault('recover_times', []).append(30.0 * fails)
+                        if sess is not None:
+                            sess.setdefault('recover_times', []).append(30.0 * fails)
                     fails = 0
                     self.q.put(('status', f'● 已连接  {loc} {ip}  延迟 {lat}ms'))
                 else:
                     fails += 1
+                    if sess is not None:
+                        sess['failures'] = sess.get('failures', 0) + 1
                     self.log(f'✗ 健康检查失败（{fails}/2）')
                     if fails < 2:
                         continue
@@ -1093,29 +1115,43 @@ class App:
                         continue
                     if stop.is_set():
                         return
-                    self._attempt_recover(node, stop)
+                    self._attempt_recover(stop)
 
         self.monitor_thread = threading.Thread(target=loop, daemon=True)
         self.monitor_thread.start()
 
-    def _attempt_recover(self, node, stop):
-        """优先用原节点重连（保持出口 IP）；连续失败且允许时才切换节点。"""
+    def _attempt_recover(self, stop):
+        """用当前活动节点重连（保持出口 IP）。用户断开/换节点后代际变化会中止。"""
+        node = self.active_node
+        if node is None:
+            return False
+        gen = self.conn_gen
         self.q.put(('status', '● 节点异常，正在重连...'))
         for attempt in (1, 2):
-            if stop.is_set():
+            if stop.is_set() or self.conn_gen != gen:
                 return False
             t0 = time.time()
             self.log(f'尝试重连原节点（第 {attempt} 次）...')
             self.core.stop()
+            if stop.is_set() or self.conn_gen != gen:
+                return False
             if self.core.start(node, self.cfg,
                                on_line=lambda line: self.q.put(('logline', line))):
+                if stop.is_set() or self.conn_gen != gen:
+                    self.core.stop()
+                    return False
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
+                if stop.is_set() or self.conn_gen != gen:
+                    self.core.stop()
+                    return False
                 if ok:
                     dt = time.time() - t0
                     self.log(f'✓ 重连成功，用时 {dt:.1f}s  出口 {loc} {ip}')
-                    if self.conn_sess is not None:
-                        self.conn_sess['reconnects'] = self.conn_sess.get('reconnects', 0) + 1
-                        self.conn_sess.setdefault('recover_times', []).append(dt)
+                    sess = self.conn_sess
+                    if sess is not None:
+                        sess['reconnects'] = sess.get('reconnects', 0) + 1
+                        sess.setdefault('recover_times', []).append(dt)
+                        sess['last_ok'] = time.time()
                     self.exit_ip = ip
                     self._restart_access_tail()
                     self._apply_tz()
@@ -1123,35 +1159,47 @@ class App:
                     return True
             time.sleep(3)
         self.log('✗ 原节点重连失败')
-        if self.cfg.get('auto_failover'):
-            return self._failover(node, stop)
+        if self.cfg.get('auto_failover') and not stop.is_set() and self.conn_gen == gen:
+            return self._failover(stop)
         self.q.put(('status', '● 节点异常（未自动切换）'))
         return False
 
-    def _failover(self, node, stop):
-        """仅当用户明确开启 auto_failover 时切换节点（会改变出口 IP）。"""
+    def _failover(self, stop):
+        """仅当用户开启 auto_failover 时切换节点（会改变出口 IP）。"""
+        node = self.active_node
+        gen = self.conn_gen
         cands = []
         for n in self.nodes:
-            if n.get('link') == node.get('link'):
+            if node is not None and n.get('link') == node.get('link'):
                 continue
             p = core.parse_node(n.get('link', ''))
             if p and core.valid_node(p):
                 cands.append((n.get('lat') or 99999, n, p))
         cands.sort(key=lambda x: x[0])
         for _, n, p in cands[:3]:
-            if stop.is_set():
+            if stop.is_set() or self.conn_gen != gen:
                 return False
             self.log(f'自动切换节点 → {n["remark"][:30]} ...')
             if self.core.start(p, self.cfg,
                                on_line=lambda line: self.q.put(('logline', line))):
+                if stop.is_set() or self.conn_gen != gen:
+                    self.core.stop()
+                    return False
                 ok, ip, loc, lat = core.health(self.cfg['http_port'])
+                if stop.is_set() or self.conn_gen != gen:
+                    self.core.stop()
+                    return False
                 if ok:
+                    self.active_node = p
                     self.connected_link = n['link']
                     self.exit_ip = ip
                     n['ip'], n['loc'], n['lat'] = ip, loc, lat
-                    if self.conn_sess is not None:
-                        self.conn_sess['ip_changes'] = self.conn_sess.get('ip_changes', 0) + 1
-                        self.conn_sess['failover_to'] = n['remark']
+                    sess = self.conn_sess
+                    if sess is not None:
+                        sess['failovers'] = sess.get('failovers', 0) + 1
+                        sess['ip_changes'] = sess.get('ip_changes', 0) + 1
+                        sess['last_ok'] = time.time()
+                        sess['failover_to'] = n['remark']
                     self.log(f'✓ 已切换节点 {n["remark"][:30]}  出口 {loc} {ip}（IP 已变化）')
                     self._restart_access_tail()
                     self._apply_tz()
@@ -1169,9 +1217,16 @@ class App:
             return
         end = time.time()
         st = sess.get('start') or end
+        online = float(sess.get('online') or 0.0)
+        last_ok = sess.get('last_ok')
+        if last_ok:
+            online += min(max(0.0, end - last_ok), 90)
         rec = {'node': sess.get('node'), 'link': sess.get('link'),
                'start': st, 'end': end, 'duration': max(0.0, end - st),
+               'online': round(online, 1),
+               'failures': int(sess.get('failures', 0)),
                'reconnects': int(sess.get('reconnects', 0)),
+               'failovers': int(sess.get('failovers', 0)),
                'ip_changes': int(sess.get('ip_changes', 0)),
                'recover_times': list(sess.get('recover_times') or []),
                'failover_to': sess.get('failover_to'),
@@ -1193,7 +1248,7 @@ class App:
         hist = self.conn_hist
         win = tk.Toplevel(self.root)
         win.title('连接统计 — 节点稳定性')
-        win.geometry('900x560')
+        win.geometry('1000x600')
         win.configure(bg=BG)
         win.transient(self.root)
         top = tk.Frame(win, bg=CARD, padx=12, pady=8)
@@ -1203,11 +1258,12 @@ class App:
         tk.Label(top, text=f'  共 {len(hist)} 条连接记录', bg=CARD, fg='#718096',
                  font=('Microsoft YaHei UI', 9)).pack(side='left')
 
-        cols = ('node', 'sessions', 'uptime', 'drops', 'recover', 'ipchg', 'last')
-        heads = {'node': '节点', 'sessions': '会话数', 'uptime': '总在线',
-                 'drops': '断线次数', 'recover': '平均恢复', 'ipchg': 'IP 变化', 'last': '最近连接'}
-        widths = {'node': 240, 'sessions': 70, 'uptime': 110, 'drops': 80,
-                  'recover': 90, 'ipchg': 80, 'last': 160}
+        cols = ('node', 'sessions', 'total', 'online', 'fails', 'recon', 'failover', 'ipchg', 'last')
+        heads = {'node': '节点', 'sessions': '会话数', 'total': '会话总时长', 'online': '实际在线',
+                 'fails': '故障次数', 'recon': '成功重连', 'failover': '故障切换',
+                 'ipchg': 'IP 变化', 'last': '最近连接'}
+        widths = {'node': 230, 'sessions': 65, 'total': 100, 'online': 100, 'fails': 75,
+                  'recon': 80, 'failover': 80, 'ipchg': 75, 'last': 150}
         wrap = tk.Frame(win, bg=CARD, padx=8, pady=8)
         wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
         tv = ttk.Treeview(wrap, columns=cols, show='headings')
@@ -1219,36 +1275,38 @@ class App:
         tv.pack(side='left', fill='both', expand=True)
         vs.pack(side='left', fill='y')
 
-        agg = {}
-        for r in hist:
-            name = r.get('node') or '未知'
-            a = agg.setdefault(name, {'sessions': 0, 'secs': 0.0, 'drops': 0,
-                                      'rec': [], 'ip': 0, 'last': ''})
-            a['sessions'] += 1
-            a['secs'] += float(r.get('duration') or 0)
-            a['drops'] += int(r.get('reconnects') or 0)
-            a['rec'] += [float(x) for x in (r.get('recover_times') or [])]
-            a['ip'] += int(r.get('ip_changes') or 0)
-            if (r.get('end_str') or '') > a['last']:
-                a['last'] = r.get('end_str') or ''
-
         def fmt_dur(sec):
-            sec = int(sec)
+            sec = int(sec or 0)
             if sec >= 3600:
                 return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
             if sec >= 60:
                 return f'{sec // 60}m{sec % 60:02d}s'
             return f'{sec}s'
 
-        for name in sorted(agg, key=lambda k: -agg[k]['secs']):
+        agg = {}
+        for r in hist:
+            name = r.get('node') or '未知'
+            a = agg.setdefault(name, {'sessions': 0, 'total': 0.0, 'online': 0.0,
+                                      'fails': 0, 'recon': 0, 'failover': 0, 'ip': 0, 'last': ''})
+            a['sessions'] += 1
+            a['total'] += float(r.get('duration') or 0)
+            a['online'] += float(r.get('online') or 0)
+            a['fails'] += int(r.get('failures') or 0)
+            a['recon'] += int(r.get('reconnects') or 0)
+            a['failover'] += int(r.get('failovers') or 0)
+            a['ip'] += int(r.get('ip_changes') or 0)
+            if (r.get('end_str') or '') > a['last']:
+                a['last'] = r.get('end_str') or ''
+
+        for name in sorted(agg, key=lambda k: -agg[k]['online']):
             a = agg[name]
-            avg = f"{sum(a['rec']) / len(a['rec']):.1f}s" if a['rec'] else '—'
-            tv.insert('', 'end', values=(name, a['sessions'], fmt_dur(a['secs']),
-                                         a['drops'], avg, a['ip'], a['last']))
+            tv.insert('', 'end', values=(name, a['sessions'], fmt_dur(a['total']),
+                                         fmt_dur(a['online']), a['fails'], a['recon'],
+                                         a['failover'], a['ip'], a['last']))
 
         bar = tk.Frame(win, bg=BG)
         bar.pack(fill='x', padx=10, pady=(0, 10))
-        tk.Label(bar, text='记录保存在 连接历史.json；断线次数=健康检查失败后的重连次数',
+        tk.Label(bar, text='记录保存在 连接历史.json；实际在线=健康检查为正常的累计时间，故障次数=连续失败触发重连的次数',
                  bg=BG, fg='#718096', font=('Microsoft YaHei UI', 8)).pack(side='left')
 
         def open_file():
@@ -1268,6 +1326,8 @@ class App:
         ttk.Button(bar, text='清空记录', command=clear).pack(side='right')
 
     def disconnect(self, silent=False):
+        self.conn_gen += 1
+        self.active_node = None
         self.monitor_stop.set()
         self._close_conn_session()
         try:

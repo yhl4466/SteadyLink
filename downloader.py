@@ -2,7 +2,7 @@
 
 不依赖第三方库，用系统 curl.exe 发请求，支持通过本地代理端口下载。
 """
-import os, re, subprocess, threading, time, urllib.parse
+import json, os, re, shutil, subprocess, threading, time, urllib.parse
 import concurrent.futures as cf
 
 CREATE = 0x08000000
@@ -72,6 +72,55 @@ def human(n):
             return (f'{n:.0f}{u}' if u == 'B' else f'{n:.2f}{u}')
         n /= 1024
     return '?'
+
+
+
+def _parts_meta_path(out_path):
+    return out_path + '.parts.json'
+
+
+def _load_json_file(path):
+    try:
+        return json.load(open(path, encoding='utf-8'))
+    except Exception:
+        return None
+
+
+def _write_json_file(path, data):
+    try:
+        tmp = path + '.tmp'
+        json.dump(data, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _remove_file(path):
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+
+
+def _prepare_parts_meta(out_path, part_dir, meta):
+    """校验续传分片是否属于同一资源；不属于（或无元数据）就清空重下。返回是否清理过。"""
+    old = _load_json_file(_parts_meta_path(out_path))
+    stale = False
+    if old is None:
+        try:
+            if os.path.isdir(part_dir) and os.listdir(part_dir):
+                stale = True
+        except Exception:
+            pass
+    else:
+        for k, v in meta.items():
+            if old.get(k) != v:
+                stale = True
+                break
+    if stale:
+        shutil.rmtree(part_dir, ignore_errors=True)
+    _write_json_file(_parts_meta_path(out_path), meta)
+    return stale
 
 
 def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
@@ -175,6 +224,8 @@ def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
 
 def _download_segments(url, out_path, size, proxy, threads, chunk, progress, stop, max_seconds):
     part_dir = out_path + '.parts'
+    meta = {'url': url, 'size': size, 'chunk': chunk, 'mode': 'segments'}
+    _prepare_parts_meta(out_path, part_dir, meta)
     os.makedirs(part_dir, exist_ok=True)
     lock = threading.Lock()
     done = [0]
@@ -250,21 +301,30 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
     if os.path.getsize(tmp_out) != size:
         return False, '合并后大小不一致（可重试续传）'
     os.replace(tmp_out, out_path)
-    import shutil
     shutil.rmtree(part_dir, ignore_errors=True)
+    _remove_file(_parts_meta_path(out_path))
     return True, out_path
 
 
 def _download_single(url, out_path, proxy, progress, stop, max_seconds):
+    meta = {'url': url, 'mode': 'single'}
+    old = _load_json_file(_parts_meta_path(out_path))
+    if os.path.exists(out_path) and old != meta:
+        _remove_file(out_path)  # 不是同一个资源，不能续传
+    if old != meta:
+        _write_json_file(_parts_meta_path(out_path), meta)
+    resume = os.path.exists(out_path) and os.path.getsize(out_path) > 0
     args = ['curl.exe', '-sS', '--ssl-no-revoke', '-L', '--max-time', '7200', '-A', UA,
             '-o', out_path, '--progress-bar']
+    if resume:
+        args += ['-C', '-']
     if proxy:
         args += ['-x', proxy]
     args.append(url)
     p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=CREATE)
     t0 = time.time()
-    last = 0
+    last = os.path.getsize(out_path) if os.path.exists(out_path) else 0
     while p.poll() is None:
         if stop.is_set():
             try:
@@ -285,7 +345,14 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds):
             progress(size, 0, sp)
         time.sleep(1)
     ok = p.returncode == 0 and os.path.exists(out_path)
-    return (True, out_path) if ok else (False, f'失败（curl 退出码 {p.returncode}）')
+    if not ok and resume:
+        # 服务器不支持续传：删掉半截文件重下一遍
+        _remove_file(out_path)
+        return _download_single(url, out_path, proxy, progress, stop, max_seconds)
+    if ok:
+        _remove_file(_parts_meta_path(out_path))
+        return True, out_path
+    return False, f'失败（curl 退出码 {p.returncode}）'
 
 
 def parse_page_links(html, base_url, proxy=None):
@@ -436,6 +503,9 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
     if bad_methods:
         return False, f'不支持的 HLS 加密方式：{", ".join(sorted(bad_methods))}'
     part_dir = out_path + '.hls_parts'
+    hls_meta = {'url': url, 'count': total, 'first': segs[0]['uri'], 'last': segs[-1]['uri'],
+                'mode': 'hls'}
+    _prepare_parts_meta(out_path, part_dir, hls_meta)
     os.makedirs(part_dir, exist_ok=True)
     done = [0]
     lock = threading.Lock()
@@ -508,8 +578,8 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
                         break
                     out.write(chunk)
     os.replace(tmp, out_path)
-    import shutil
     shutil.rmtree(part_dir, ignore_errors=True)
+    _remove_file(_parts_meta_path(out_path))
     return True, out_path
 
 

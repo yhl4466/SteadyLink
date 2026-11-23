@@ -489,7 +489,10 @@ def restore_proxy_state():
 def set_system_proxy(port):
     if port is None:
         return restore_proxy_state()
-    save_proxy_state()
+    # 备份失败则拒绝接管系统代理，避免退出后无法还原
+    saved = save_proxy_state()
+    if not saved and not os.path.exists(PROXY_BACKUP):
+        return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, 'ProxyServer', 0, winreg.REG_SZ, f'127.0.0.1:{port}')
@@ -501,6 +504,11 @@ def set_system_proxy(port):
         _proxy_refresh()
         return True
     except Exception:
+        # 写入失败时按备份回滚
+        try:
+            restore_proxy_state()
+        except Exception:
+            pass
         return False
 
 
