@@ -90,7 +90,8 @@ def _parts_meta_path(out_path):
 
 def _load_json_file(path):
     try:
-        return json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
     except Exception:
         return None
 
@@ -98,7 +99,8 @@ def _load_json_file(path):
 def _write_json_file(path, data):
     try:
         tmp = path + '.tmp'
-        json.dump(data, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -162,7 +164,8 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8):
             code = ''
         head = ''
         try:
-            head = open(hdr, encoding='utf-8', errors='replace').read()
+            with open(hdr, encoding='utf-8', errors='replace') as f:
+                head = f.read()
         except Exception:
             pass
         try:
@@ -429,7 +432,10 @@ def _fetch_bytes(url, proxy=None, timeout=60):
     try:
         r = _curl(args + [url], timeout=timeout + 15)
         code = (r.stdout or '').strip()
-        data = open(p, 'rb').read() if os.path.exists(p) else b''
+        data = b''
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                data = f.read()
         return code, data
     finally:
         try:

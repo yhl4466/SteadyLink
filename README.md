@@ -92,6 +92,18 @@ python steadylink.py
 
 工具栏「导入订阅」粘贴机场订阅链接，或「从剪贴板导入」粘贴节点链接，然后选中节点点「连接」。
 
+## 测试
+
+关键路径的故障注入测试（无需外网，下载/HLS 用本地 HTTP 服务器）：
+
+```bash
+python tests/run_tests.py -v
+```
+
+覆盖：核心启动令牌（过期线程不误杀新进程）、自动重连并发/停止、系统代理备份与恢复、在线时长口径、HTTP 分段校验与回退、HLS AES-128/错误密钥/不支持加密、续传资源身份（URL/大小/ETag/HLS 摘要）。
+
+详见 [tests/README.md](tests/README.md)。
+
 ## 目录结构
 
 ```
@@ -103,6 +115,7 @@ SteadyLink/
 ├── bin/                   # Xray 与 aria2c（不入库，由 setup_bin.py 下载）
 ├── scripts/setup_bin.py   # 一键下载内核
 ├── docs/screenshots/      # 截图
+├── tests/                 # 故障注入测试（python tests/run_tests.py）
 ├── config.example.json    # 配置样例
 ├── nodes.example.json     # 节点样例
 └── 使用说明.md             # 详细中文说明

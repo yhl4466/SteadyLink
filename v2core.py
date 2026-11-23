@@ -352,13 +352,23 @@ class Core:
             token = self._token
             self.on_line = on_line
             access_path = os.path.join(CFG_DIR, 'access.log') if cfg.get('access_log') else None
-            c = build_config(node, cfg['http_port'], cfg['socks_port'], cfg['stats_port'],
-                             log_level=cfg.get('core_log_level', 'info'), access_log=access_path,
-                             allow_insecure=bool(cfg.get('allow_insecure')))
+            try:
+                c = build_config(node, cfg['http_port'], cfg['socks_port'], cfg['stats_port'],
+                                 log_level=cfg.get('core_log_level', 'info'),
+                                 access_log=access_path,
+                                 allow_insecure=bool(cfg.get('allow_insecure')))
+            except Exception as e:
+                try:
+                    if on_line:
+                        on_line(f'节点配置无效：{e}')
+                except Exception:
+                    pass
+                return 0
             if not c:
                 return 0
             try:
-                json.dump(c, open(self.cfg_path, 'w', encoding='utf-8'), ensure_ascii=False)
+                with open(self.cfg_path, 'w', encoding='utf-8') as cf:
+                    json.dump(c, cf, ensure_ascii=False)
                 p = subprocess.Popen([CORE, 'run', '-c', self.cfg_path],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1, creationflags=CREATE,
@@ -471,7 +481,8 @@ def save_proxy_state(force=False):
         return False
     try:
         tmp = PROXY_BACKUP + '.tmp'
-        json.dump(data, open(tmp, 'w', encoding='utf-8'), ensure_ascii=False)
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, PROXY_BACKUP)
         return True
     except Exception:
@@ -496,7 +507,8 @@ def _valid_proxy_backup(data):
 
 def load_proxy_backup():
     try:
-        data = json.load(open(PROXY_BACKUP, encoding='utf-8'))
+        with open(PROXY_BACKUP, encoding='utf-8') as f:
+            data = json.load(f)
     except Exception:
         return None
     return data if _valid_proxy_backup(data) else None
