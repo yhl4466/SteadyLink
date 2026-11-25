@@ -134,6 +134,19 @@ def _prepare_parts_meta(out_path, part_dir, meta):
     return stale
 
 
+def auto_chunk_size(size):
+    """按文件大小选择分片：分片越小进度越平滑，但连接开销更大。"""
+    if not size:
+        return 4 * 1024 * 1024
+    if size <= 8 * 1024 * 1024:
+        return max(1, size)
+    if size <= 64 * 1024 * 1024:
+        return 2 * 1024 * 1024
+    if size <= 512 * 1024 * 1024:
+        return 4 * 1024 * 1024
+    return 8 * 1024 * 1024
+
+
 def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8,
                  etag='', last_modified=''):
     """下载一个分段；严格校验 206 状态、Content-Range 与长度。
@@ -155,6 +168,7 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8,
         tmp = part + '.tmp'
         hdr = part + '.hdr'
         args = ['-L', '-D', hdr, '-r', f'{start + have}-{end}', '--max-time', '120',
+                '--connect-timeout', '10', '--speed-limit', '4096', '--speed-time', '20',
                 '-A', UA, '-o', tmp, '-w', '%{http_code}']
         if etag and not str(etag).startswith('W/'):
             args += ['-H', f'If-Range: {etag}']
@@ -241,7 +255,7 @@ def _fetch_chunk(url, part, start, end, proxy, stop, on_bytes, retries=8,
     return 'ok' if have >= need else 'error'
 
 
-def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
+def download(url, out_path, proxy=None, threads=8, chunk=None,
              progress=None, stop=None, max_seconds=None):
     """多线程断点续传下载。
 
@@ -252,6 +266,8 @@ def download(url, out_path, proxy=None, threads=8, chunk=8 * 1024 * 1024,
     info = probe(url, proxy)
     if info.get('error'):
         return False, f"探测失败：{info['error']}"
+    if not chunk or chunk <= 0:
+        chunk = auto_chunk_size(info.get('size'))
     if info.get('range') is not None and info.get('size') and info['range'] and threads > 1:
         ok, msg = _download_segments(url, out_path, info['size'], proxy, threads, chunk, progress,
                                      stop, max_seconds, etag=info.get('etag', ''),
@@ -291,18 +307,34 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
                 done[0] += min(os.path.getsize(p), end - start + 1)
         idx += 1
 
-    def on_bytes(n):
-        with lock:
-            done[0] += n
+    def disk_bytes():
+        total = 0
+        for i, st, en in chunks:
+            base = os.path.join(part_dir, f'{i:05d}.part')
+            got = 0
+            for pth in (base, base + '.tmp'):
+                try:
+                    got += os.path.getsize(pth)
+                except OSError:
+                    pass
+            total += min(got, en - st + 1)
+        return min(total, size)
+
+    measure_stop = threading.Event()
 
     def reporter():
-        last = done[0]
-        while not stop.is_set():
-            time.sleep(0.8)
+        last_total = disk_bytes()
+        last_t = time.time()
+        while not measure_stop.is_set():
+            if measure_stop.wait(0.4):
+                break
+            cur = disk_bytes()
+            now = time.time()
+            dt = max(0.001, now - last_t)
+            sp = max(0.0, (cur - last_total) / dt)
+            last_total, last_t = cur, now
             with lock:
-                cur = done[0]
-            sp = (cur - last) / 0.8
-            last = cur
+                done[0] = cur
             if progress:
                 progress(cur, size, sp)
             if max_seconds and time.time() - t0 > max_seconds:
@@ -314,12 +346,17 @@ def _download_segments(url, out_path, size, proxy, threads, chunk, progress, sto
     def work(c):
         i, s, e = c
         part = os.path.join(part_dir, f'{i:05d}.part')
-        return _fetch_chunk(url, part, s, e, proxy, stop, on_bytes,
+        return _fetch_chunk(url, part, s, e, proxy, stop, lambda n: None,
                             etag=etag, last_modified=last_modified)
 
     with cf.ThreadPoolExecutor(max_workers=max(1, int(threads))) as ex:
         results = list(ex.map(work, chunks))
+    measure_stop.set()
 
+    with lock:
+        done[0] = max(done[0], sum(
+            min(os.path.getsize(os.path.join(part_dir, f'{i:05d}.part')), e - s + 1)
+            for i, s, e in chunks if os.path.exists(os.path.join(part_dir, f'{i:05d}.part'))))
     if progress:
         progress(done[0], size, 0)
     if stop.is_set() or 'stopped' in results:
@@ -369,8 +406,9 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds,
     if old != meta:
         _write_json_file(_parts_meta_path(out_path), meta)
     resume = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    args = ['curl.exe', '-sS', '-f', '--ssl-no-revoke', '-L', '--max-time', '7200', '-A', UA,
-            '-o', out_path, '--progress-bar']
+    args = ['curl.exe', '-sS', '-f', '--ssl-no-revoke', '-L', '--max-time', '7200',
+            '--connect-timeout', '10', '--speed-limit', '1024', '--speed-time', '30',
+            '-A', UA, '-o', out_path, '--progress-bar']
     if resume:
         args += ['-C', '-']
         if etag and not str(etag).startswith('W/'):
@@ -402,7 +440,7 @@ def _download_single(url, out_path, proxy, progress, stop, max_seconds,
         last = size
         if progress:
             progress(size, 0, sp)
-        time.sleep(1)
+        time.sleep(0.3)
     ok = p.returncode == 0 and os.path.exists(out_path)
     if not ok and resume:
         # 服务器不支持续传：删掉半截文件重下一遍
@@ -684,6 +722,86 @@ def hls_download(url, out_path, proxy=None, threads=8, progress=None, stop=None,
     return True, out_path
 
 
+def http_download_aria2(url, out_path, proxy=None, threads=8, progress=None, stop=None,
+                        max_seconds=None):
+    """用 aria2c 多连接下载 HTTP 文件（抗抖动、自带重试）。返回 (ok, msg)。"""
+    import queue as _queue
+    aria = aria2_path()
+    if not aria:
+        return False, '未找到 aria2c（缺少 bin/aria2/aria2c.exe）'
+    stop = stop or threading.Event()
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    name = os.path.basename(out_path)
+    meta_path = _parts_meta_path(out_path)
+    meta = {'url': url, 'mode': 'aria2'}
+    if _load_json_file(meta_path) != meta:
+        # 资源身份不一致：清掉旧文件与 aria2 控制文件
+        _remove_file(out_path)
+        _remove_file(out_path + '.aria2')
+        _write_json_file(meta_path, meta)
+    n = max(1, int(threads))
+    args = [aria, url, f'--dir={out_dir}', f'--out={name}', '--continue=true',
+            '--auto-file-renaming=false', '--file-allocation=none',
+            f'--split={n}', f'--max-connection-per-server={n}', '--min-split-size=1M',
+            '--summary-interval=1', '--console-log-level=notice',
+            '--lowest-speed-limit=4K', '--max-tries=5', '--retry-wait=2', '--no-conf']
+    if proxy:
+        args.append(f'--all-proxy={proxy}')
+    try:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1, creationflags=CREATE, errors='replace')
+    except Exception as e:
+        return False, f'aria2 启动失败: {e}'
+    q = _queue.Queue()
+
+    def reader():
+        try:
+            for line in p.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    t0 = time.time()
+    while True:
+        if stop.is_set():
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return False, '已取消'
+        if max_seconds and time.time() - t0 > max_seconds:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return False, '超时中止'
+        try:
+            line = q.get(timeout=0.5)
+        except _queue.Empty:
+            if p.poll() is not None:
+                break
+            continue
+        if line is None:
+            break
+        m = ARIA2_PROGRESS.search(line.rstrip())
+        if m and progress:
+            progress(_to_bytes(m.group(1), m.group(2)), _to_bytes(m.group(3), m.group(4)),
+                     _to_bytes(m.group(6), m.group(7)))
+    rc = p.wait()
+    try:
+        if p.stdout:
+            p.stdout.close()
+    except Exception:
+        pass
+    if rc == 0:
+        _remove_file(meta_path)
+        return True, out_path
+    return False, f'aria2 退出码 {rc}'
+
+
 # ==================== 磁力 / BT（aria2c） ====================
 def aria2_path():
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'aria2', 'aria2c.exe')
@@ -772,6 +890,11 @@ def bt_download(magnet, out_dir, proxy=None, progress=None, stop=None, log=None,
             rc = p.wait(timeout=5)
         except Exception:
             rc = -1
+    try:
+        if p.stdout:
+            p.stdout.close()
+    except Exception:
+        pass
     return (True, out_dir) if rc == 0 else (False, f'aria2 退出码 {rc}')
 
 

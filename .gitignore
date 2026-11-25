@@ -240,3 +240,5 @@ download.log
 *.hls_parts/
 *.lnk
 *.tmp
+
+连接历史.json

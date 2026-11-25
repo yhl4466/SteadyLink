@@ -137,6 +137,24 @@ class HttpRangeTest(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_auto_chunk_size(self):
+        self.assertEqual(dl.auto_chunk_size(5 * 1024 * 1024), 5 * 1024 * 1024)
+        self.assertEqual(dl.auto_chunk_size(30 * 1024 * 1024), 2 * 1024 * 1024)
+        self.assertEqual(dl.auto_chunk_size(200 * 1024 * 1024), 4 * 1024 * 1024)
+        self.assertEqual(dl.auto_chunk_size(None), 4 * 1024 * 1024)
+
+    def test_aria2_http_backend(self):
+        if not dl.aria2_path():
+            self.skipTest('缺少 aria2c')
+        srv = RangeServer(self.data, 'range')
+        try:
+            out = os.path.join(self.tmp, 'aria.bin')
+            ok, msg = dl.http_download_aria2(srv.url, out, threads=4)
+            self.assertTrue(ok, msg)
+            self.assertEqual(_read(out), self.data)
+        finally:
+            srv.close()
+
     def test_resume_ignores_parts_from_other_url(self):
         # 伪造别的 URL 留下的分片（内容错误），续传时必须被丢弃
         out = os.path.join(self.tmp, 'resume.bin')

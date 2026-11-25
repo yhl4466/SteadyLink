@@ -1615,6 +1615,10 @@ class DownloaderWindow(tk.Toplevel):
         self.transient(app.root)
         self.rules = dl.load_rules()
         self.tasks = dl.load_tasks()
+        self._logq = queue.Queue()
+        self._snap = {'proxy': bool(app.cfg.get('dl_proxy', True)),
+                      'threads': int(app.cfg.get('dl_threads', 8) or 8),
+                      'aria': bool(dl.aria2_path())}
         for t in self.tasks:
             t.setdefault('kind', 'http')
             t.setdefault('stop', threading.Event())
@@ -1657,6 +1661,11 @@ class DownloaderWindow(tk.Toplevel):
         e.bind('<Return>', lambda ev: self.start_direct())
         self.proxy_var = tk.BooleanVar(value=bool(app.cfg.get('dl_proxy', True)))
         ttk.Checkbutton(r1, text='走代理', variable=self.proxy_var).pack(side='left')
+        default_backend = app.cfg.get('dl_backend') or ('aria2' if dl.aria2_path() else 'curl')
+        self.backend_var = tk.BooleanVar(value=(default_backend == 'aria2'))
+        tk.Checkbutton(r1, text='多连接(aria2)', variable=self.backend_var, bg=CARD,
+                       fg='#4a5568', activebackground=CARD,
+                       font=('Microsoft YaHei UI', 9)).pack(side='left', padx=(8, 0))
         self.threads_var = tk.IntVar(value=int(app.cfg.get('dl_threads', 8)))
         tk.Label(r1, text='线程', bg=CARD, fg='#4a5568').pack(side='left', padx=(8, 2))
         ttk.Spinbox(r1, from_=1, to=16, width=4, textvariable=self.threads_var).pack(side='left')
@@ -1751,16 +1760,25 @@ class DownloaderWindow(tk.Toplevel):
         widget.tag_configure('core', foreground='#90cdf4')
 
     def dlog(self, msg, tag='info'):
-        stamp = time.strftime('%H:%M:%S')
-        try:
-            self.log_box.insert('end', f"{stamp} {msg}\n", tag)
-            total = int(self.log_box.index('end-1c').split('.')[0])
-            if total > 4000:
-                self.log_box.delete('1.0', '1500.0')
-            self.log_box.see('end')
-        except Exception:
-            pass
+        # 线程安全：工作线程只入队，由主线程 _poll 写入控件
+        self._logq.put((msg, tag))
         dl.dl_log(msg)
+
+    def _drain_logq(self):
+        while True:
+            try:
+                msg, tag = self._logq.get_nowait()
+            except queue.Empty:
+                break
+            stamp = time.strftime('%H:%M:%S')
+            try:
+                self.log_box.insert('end', f"{stamp} {msg}\n", tag)
+                total = int(self.log_box.index('end-1c').split('.')[0])
+                if total > 4000:
+                    self.log_box.delete('1.0', '1500.0')
+                self.log_box.see('end')
+            except Exception:
+                pass
 
     def clear_dl_log(self):
         try:
@@ -1788,7 +1806,7 @@ class DownloaderWindow(tk.Toplevel):
             if self.app.core.running():
                 return f"http://127.0.0.1:{self.app.cfg['http_port']}", '规则:代理'
             return None, '规则:代理(未连接,直连)'
-        if not self.proxy_var.get():
+        if not self._snap['proxy']:
             return None, '未勾选代理'
         if not self.app.core.running():
             return None, '未连接节点,直连'
@@ -2007,10 +2025,30 @@ class DownloaderWindow(tk.Toplevel):
         task['size'] = info.get('size') or 0
         task['out'] = self._unique_path(task['name'])
         task['status'] = '下载中'
-        dlog(f"开始下载: {task['name']} ({dl.human(task['size'])}, {self.threads_var.get()} 线程, {task.get('proxy_used','')})")
-        ok, msg = dl.download(task['url'], task['out'], proxy=proxy,
-                              threads=max(1, int(self.threads_var.get())),
-                              progress=self._progress_cb(task), stop=task['stop'])
+        threads = max(1, int(self._snap['threads']))
+        # 小文件用 curl 更省事；大文件用 aria2 多连接更稳
+        small = task.get('size') and task['size'] < 4 * 1024 * 1024
+        use_aria = bool(self._snap['aria']) and bool(dl.aria2_path()) and not small
+        try:
+            self.app.cfg['dl_backend'] = 'aria2' if use_aria else 'curl'
+            core.save_config(self.app.cfg)
+        except Exception:
+            pass
+        if use_aria:
+            dlog(f"开始下载(aria2 {threads} 连接): {task['name']} ({dl.human(task['size'])}, {task.get('proxy_used','')})")
+            ok, msg = dl.http_download_aria2(task['url'], task['out'], proxy=proxy,
+                                             threads=threads,
+                                             progress=self._progress_cb(task), stop=task['stop'])
+            if not ok and not task['stop'].is_set():
+                dlog(f'aria2 失败（{msg}），改用 curl 分段重试', 'warn')
+                task['done'] = 0
+                task['size'] = 0
+                ok, msg = dl.download(task['url'], task['out'], proxy=proxy, threads=threads,
+                                      progress=self._progress_cb(task), stop=task['stop'])
+        else:
+            dlog(f"开始下载: {task['name']} ({dl.human(task['size'])}, {threads} 线程, {task.get('proxy_used','')})")
+            ok, msg = dl.download(task['url'], task['out'], proxy=proxy, threads=threads,
+                                  progress=self._progress_cb(task), stop=task['stop'])
         task['status'] = '完成' if ok else ('已取消' if task['stop'].is_set() else '失败')
         if ok:
             dlog(f'✓ 下载完成: {task["out"]}')
@@ -2027,7 +2065,7 @@ class DownloaderWindow(tk.Toplevel):
         task['status'] = '下载中'
         self.dlog(f"开始 HLS 下载: {task['name']} ({task.get('proxy_used','')})")
         ok, msg = dl.hls_download(task['url'], task['out'], proxy=proxy,
-                                  threads=max(1, int(self.threads_var.get())),
+                                  threads=max(1, int(self._snap['threads'])),
                                   progress=self._progress_cb(task), stop=task['stop'],
                                   log=lambda m: self.dlog(m))
         task['status'] = '完成' if ok else ('已取消' if task['stop'].is_set() else '失败')
@@ -2154,6 +2192,14 @@ class DownloaderWindow(tk.Toplevel):
         dl.save_tasks(data)
 
     def _poll(self):
+        # 主线程读取控件状态，工作线程只用快照
+        try:
+            self._snap['proxy'] = bool(self.proxy_var.get())
+            self._snap['threads'] = max(1, int(self.threads_var.get() or 8))
+            self._snap['aria'] = bool(self.backend_var.get())
+        except Exception:
+            pass
+        self._drain_logq()
         # 行数与任务数不一致时重建（加载持久化任务 / 新增任务）
         if len(self.tree.get_children()) != len(self.tasks):
             self.tree.delete(*self.tree.get_children())
