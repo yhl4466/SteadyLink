@@ -17,6 +17,8 @@
 |---|---|
 | ![主界面](docs/screenshots/main.png) | ![下载器](docs/screenshots/downloader.png) |
 
+![设置](docs/screenshots/settings.png)
+
 ![站点代理规则](docs/screenshots/rules.png)
 
 ![连接统计](docs/screenshots/stats.png)

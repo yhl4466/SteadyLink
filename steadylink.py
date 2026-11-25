@@ -96,13 +96,16 @@ def pretty_remark(rem):
     return re.sub(r'\s{2,}', ' ', s).strip() or (rem or '')
 
 
-BG = '#eef1f6'
+BG = '#f3f6fb'
 CARD = '#ffffff'
-BORDER = '#e2e8f0'
-ACCENT = '#2b6cb0'
-OKC = '#1a7f37'
-WARNC = '#b45309'
-ERRC = '#b91c1c'
+BORDER = '#e3e9f2'
+ACCENT = '#2563eb'
+ACCENT_DARK = '#1d4ed8'
+TEXT = '#1f2937'
+MUTED = '#64748b'
+OKC = '#16a34a'
+WARNC = '#d97706'
+ERRC = '#dc2626'
 
 COLS = ('remark', 'addr', 'port', 'proto', 'lat', 'ip', 'loc', 'state')
 HEADS = {'remark': '别名', 'addr': '地址', 'port': '端口', 'proto': '协议',
@@ -153,14 +156,8 @@ class App:
         root.minsize(1000, 640)
         root.configure(bg=BG)
         root.protocol('WM_DELETE_WINDOW', self.on_close)
-        try:
-            if os.path.exists(ICON_ICO):
-                root.iconbitmap(default=ICON_ICO)
-            if os.path.exists(ICON_PNG):
-                self._icon_img = tk.PhotoImage(file=ICON_PNG)
-                root.iconphoto(True, self._icon_img)
-        except Exception:
-            pass
+        self._set_window_icon()
+        self.root.after(250, self._set_window_icon)
         self._style()
         self._build()
         self._maybe_first_import()
@@ -170,6 +167,18 @@ class App:
         self._tick()
         self.root.after(600, self._proxy_recovery_check)
 
+    def _set_window_icon(self):
+        """Windows 标题栏/任务栏图标：优先多尺寸 ico，非 Windows 用 png。"""
+        try:
+            if os.path.exists(ICON_ICO):
+                self.root.iconbitmap(ICON_ICO)
+                self.root.iconbitmap(default=ICON_ICO)
+            elif sys.platform != 'win32' and os.path.exists(ICON_PNG):
+                self._icon_img = tk.PhotoImage(file=ICON_PNG)
+                self.root.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
     # ---------------- UI ----------------
     def _style(self):
         st = ttk.Style()
@@ -177,45 +186,108 @@ class App:
             st.theme_use('clam')
         except Exception:
             pass
-        st.configure('.', font=('Microsoft YaHei UI', 10), background=BG)
+        st.configure('.', font=('Microsoft YaHei UI', 10), background=BG, foreground=TEXT)
         st.configure('TFrame', background=BG)
-        st.configure('TButton', padding=(12, 6), background='#edf2f7', foreground='#2d3748',
+        st.configure('Card.TFrame', background=CARD)
+        st.configure('TLabel', background=BG, foreground=TEXT)
+        st.configure('Card.TLabel', background=CARD, foreground=TEXT)
+        st.configure('Muted.TLabel', foreground=MUTED, font=('Microsoft YaHei UI', 9))
+        st.configure('H1.TLabel', font=('Microsoft YaHei UI', 17, 'bold'), foreground=TEXT)
+        st.configure('H2.TLabel', font=('Microsoft YaHei UI', 12, 'bold'), foreground=TEXT)
+        st.configure('TButton', padding=(12, 6), background='#eef2f9', foreground=TEXT,
                      borderwidth=0, focusthickness=0, relief='flat',
                      font=('Microsoft YaHei UI', 10))
-        st.map('TButton', background=[('active', '#e2e8f0'), ('pressed', '#cbd5e0')])
+        st.map('TButton', background=[('active', '#e0e7f3'), ('pressed', '#cfd9e8')])
+        st.configure('Ghost.TButton', background=CARD, padding=(10, 6), foreground=TEXT,
+                     borderwidth=0, focusthickness=0, relief='flat')
+        st.map('Ghost.TButton', background=[('active', '#eef2f9'), ('pressed', '#e0e7f3')])
         st.configure('Primary.TButton', background=ACCENT, foreground='white',
-                     font=('Microsoft YaHei UI', 10, 'bold'))
-        st.map('Primary.TButton', background=[('active', '#2b6cb0'), ('pressed', '#1f4f8b')])
-        st.configure('Danger.TButton', background='#fff5f5', foreground=ERRC)
-        st.map('Danger.TButton', background=[('active', '#fed7d7')])
-        st.configure('TEntry', fieldbackground='white', padding=4)
-        st.configure('TCombobox', padding=3)
-        st.configure('Treeview', rowheight=30, font=('Microsoft YaHei UI', 10),
+                     font=('Microsoft YaHei UI', 10, 'bold'), padding=(16, 7))
+        st.map('Primary.TButton', background=[('active', ACCENT_DARK), ('pressed', '#1e40af')])
+        st.configure('Danger.TButton', background='#fff1f2', foreground=ERRC)
+        st.map('Danger.TButton', background=[('active', '#ffe4e6')])
+        st.configure('TCheckbutton', background=BG, foreground=TEXT,
+                     font=('Microsoft YaHei UI', 9))
+        st.configure('Card.TCheckbutton', background=CARD, foreground=TEXT,
+                     font=('Microsoft YaHei UI', 9))
+        st.map('TCheckbutton', background=[('active', BG)])
+        st.map('Card.TCheckbutton', background=[('active', CARD)])
+        st.configure('TEntry', fieldbackground='white', padding=5)
+        st.configure('TCombobox', padding=4)
+        st.configure('TSeparator', background=BORDER)
+        st.configure('Treeview', rowheight=32, font=('Microsoft YaHei UI', 10),
                      background=CARD, fieldbackground=CARD, borderwidth=0)
         st.configure('Treeview.Heading', font=('Microsoft YaHei UI', 9, 'bold'),
-                     background='#edf2f7', foreground='#4a5568', relief='flat', padding=(6, 6))
-        st.map('Treeview', background=[('selected', '#bee3f8')], foreground=[('selected', '#1a202c')])
-        st.map('Treeview.Heading', background=[('active', '#e2e8f0')])
-        st.configure('TScrollbar', background='#e2e8f0', arrowcolor='#4a5568')
+                     background='#f1f5fb', foreground=MUTED, relief='flat', padding=(8, 7))
+        st.map('Treeview', background=[('selected', '#dbeafe')],
+               foreground=[('selected', '#0f172a')])
+        st.map('Treeview.Heading', background=[('active', '#e8eef8')])
+        st.configure('TScrollbar', background='#e8edf5', arrowcolor=MUTED,
+                     borderwidth=0, troughcolor='#f7f9fd')
+        self._setup_check_images(st)
+        st.configure('TNotebook', background=BG, borderwidth=0)
+        st.configure('TNotebook.Tab', padding=(14, 6), font=('Microsoft YaHei UI', 9))
+        st.map('TNotebook.Tab', background=[('selected', CARD)])
+
+    def _setup_check_images(self, st):
+        """用自绘图片替换默认的方框+叉，统一成圆角勾选样式。"""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+            def make(kind):
+                im = Image.new('RGBA', (18, 18), (0, 0, 0, 0))
+                d = ImageDraw.Draw(im)
+                if kind == 'off':
+                    d.rounded_rectangle([1, 1, 16, 16], radius=5, fill='white',
+                                        outline='#cbd5e1', width=2)
+                elif kind == 'hover':
+                    d.rounded_rectangle([1, 1, 16, 16], radius=5, fill='#f8fafc',
+                                        outline=ACCENT, width=2)
+                else:
+                    d.rounded_rectangle([1, 1, 16, 16], radius=5, fill=ACCENT,
+                                        outline=ACCENT, width=2)
+                    d.line([(4.5, 9), (7.5, 12), (13, 5.5)], fill='white', width=2)
+                return ImageTk.PhotoImage(im)
+            self._ck_imgs = {k: make(k) for k in ('off', 'hover', 'on')}
+            st.element_create('Steady.Ck', 'image', self._ck_imgs['off'],
+                              ('selected', self._ck_imgs['on']),
+                              ('active', self._ck_imgs['hover']),
+                              ('disabled', self._ck_imgs['off']))
+            for name in ('TCheckbutton', 'Card.TCheckbutton'):
+                st.layout(name, [('Checkbutton.padding', {
+                    'sticky': 'nswe', 'children': [
+                        ('Steady.Ck', {'side': 'left', 'sticky': ''}),
+                        ('Checkbutton.label', {'sticky': 'nswe'}),
+                    ]})])
+        except Exception:
+            pass
 
     def _build(self):
         # ---- 标题栏 ----
         header = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         header.pack(fill='x')
-        inner = tk.Frame(header, bg=CARD, padx=16, pady=10)
+        inner = tk.Frame(header, bg=CARD, padx=18, pady=12)
         inner.pack(fill='x')
-        tk.Label(inner, text='SteadyLink', bg=CARD, fg='#1a202c',
-                 font=('Microsoft YaHei UI', 16, 'bold')).pack(side='left')
-        tk.Label(inner, text='   节点管理器 · 固定 IP · 防封号', bg=CARD, fg='#718096',
-                 font=('Microsoft YaHei UI', 9)).pack(side='left')
-        self.status_pill = tk.Label(inner, text='● 未连接', bg='#a0aec0', fg='white',
-                                    font=('Microsoft YaHei UI', 9, 'bold'), padx=14, pady=4)
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(ICON_PNG).resize((38, 38), Image.LANCZOS)
+            self._header_icon = ImageTk.PhotoImage(img)
+            tk.Label(inner, image=self._header_icon, bg=CARD).pack(side='left', padx=(0, 12))
+        except Exception:
+            pass
+        title_box = tk.Frame(inner, bg=CARD)
+        title_box.pack(side='left')
+        tk.Label(title_box, text='SteadyLink', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 17, 'bold')).pack(anchor='w')
+        tk.Label(title_box, text='节点管理器 · 固定 IP · 防封号', bg=CARD, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(1, 0))
+        self.status_pill = tk.Label(inner, text='● 未连接', bg='#94a3b8', fg='white',
+                                    font=('Microsoft YaHei UI', 9, 'bold'), padx=16, pady=5)
         self.status_pill.pack(side='right')
 
         # ---- 工具栏 ----
         bar = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        bar.pack(fill='x', padx=10, pady=(8, 0))
-        b = tk.Frame(bar, bg=CARD, padx=10, pady=8)
+        bar.pack(fill='x', padx=10, pady=(10, 0))
+        b = tk.Frame(bar, bg=CARD, padx=12, pady=9)
         b.pack(fill='x')
         self.btn_update = ttk.Button(b, text='⟳ 更新订阅', command=self.update_sub)
         self.btn_update.pack(side='left')
@@ -234,22 +306,24 @@ class App:
         ttk.Button(b, text='■ 断开', command=self.disconnect).pack(side='left', padx=6)
         ttk.Button(b, text='删除', style='Danger.TButton',
                    command=self.delete_selected).pack(side='left')
-        ttk.Button(b, text='⚙ 设置', command=self.open_settings).pack(side='right')
-        ttk.Button(b, text='⬇ 下载器', command=self.open_downloader).pack(side='left', padx=(10, 0))
+        ttk.Button(b, text='⚙ 设置', style='Ghost.TButton',
+                   command=self.open_settings).pack(side='right')
+        ttk.Button(b, text='⬇ 下载器', style='Ghost.TButton',
+                   command=self.open_downloader).pack(side='left', padx=(10, 0))
 
         # ---- 筛选行 ----
         info = tk.Frame(self.root, bg=BG)
-        info.pack(fill='x', padx=12, pady=(8, 2))
-        tk.Label(info, text='地区', bg=BG, fg='#4a5568',
+        info.pack(fill='x', padx=14, pady=(10, 4))
+        tk.Label(info, text='地区', bg=BG, fg=MUTED,
                  font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left')
         self.region_combo = ttk.Combobox(info, textvariable=self.region_var, width=12,
                                          state='readonly')
         self.region_combo.pack(side='left', padx=(6, 14))
         self.region_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh())
-        tk.Label(info, text='搜索', bg=BG, fg='#4a5568',
+        tk.Label(info, text='搜索', bg=BG, fg=MUTED,
                  font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left')
-        ttk.Entry(info, textvariable=self.filter_text, width=26).pack(side='left', padx=6)
-        tk.Label(info, textvariable=self.count_var, bg=BG, fg='#718096',
+        ttk.Entry(info, textvariable=self.filter_text, width=30).pack(side='left', padx=6)
+        tk.Label(info, textvariable=self.count_var, bg=BG, fg=MUTED,
                  font=('Microsoft YaHei UI', 9)).pack(side='right')
 
         # ---- 状态栏（底部）----
@@ -257,11 +331,12 @@ class App:
         sb.pack(fill='x', side='bottom')
         self.usage_var = tk.StringVar()
         self.meta_var = tk.StringVar()
-        tk.Label(sb, textvariable=self.usage_var, bg=CARD, fg='#4a5568',
-                 font=('Microsoft YaHei UI', 9), anchor='w', padx=10, pady=5).pack(side='left')
-        tk.Label(sb, textvariable=self.meta_var, bg=CARD, fg='#718096',
-                 font=('Microsoft YaHei UI', 9), anchor='e', padx=10, pady=5).pack(side='right')
-        ttk.Button(sb, text='📊 连接统计', command=self.show_conn_stats).pack(side='right', padx=6, pady=2)
+        tk.Label(sb, textvariable=self.usage_var, bg=CARD, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9), anchor='w', padx=14, pady=6).pack(side='left')
+        tk.Label(sb, textvariable=self.meta_var, bg=CARD, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9), anchor='e', padx=12, pady=6).pack(side='right')
+        ttk.Button(sb, text='📊 连接统计', style='Ghost.TButton',
+                   command=self.show_conn_stats).pack(side='right', padx=4, pady=2)
 
         # ---- 日志卡片（底部，仿 v2rayN 运行日志）----
         logcard = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -270,15 +345,17 @@ class App:
         lc.pack(fill='both', expand=True)
         logbar = tk.Frame(lc, bg=CARD)
         logbar.pack(fill='x', pady=(0, 3))
-        tk.Label(logbar, text='运行日志', bg=CARD, fg='#4a5568',
-                 font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left')
+        tk.Label(logbar, text='●', bg=CARD, fg=ACCENT,
+                 font=('Microsoft YaHei UI', 9)).pack(side='left', padx=(0, 4))
+        tk.Label(logbar, text='运行日志', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 10, 'bold')).pack(side='left')
         for text, cmd in (('清空', self.clear_log), ('暂停滚动', self.toggle_log_pause),
                           ('放大窗口', self.open_log_window), ('导出', self.export_log),
                           ('日志目录', self.open_log_dir)):
-            ttk.Button(logbar, text=text, command=cmd).pack(side='left', padx=(6, 0))
+            ttk.Button(logbar, text=text, style='Ghost.TButton', command=cmd).pack(side='left', padx=(4, 0))
         self.log_pause_btn = None
-        tk.Label(logbar, text='会话日志级别: ' + str(self.cfg.get('core_log_level', 'info')),
-                 bg=CARD, fg='#a0aec0', font=('Microsoft YaHei UI', 8)).pack(side='right')
+        tk.Label(logbar, text='级别 ' + str(self.cfg.get('core_log_level', 'info')),
+                 bg=CARD, fg=MUTED, font=('Microsoft YaHei UI', 8)).pack(side='right')
         self.log_box = tk.Text(lc, height=6, wrap='none', font=('Consolas', 9),
                                bg='#0f172a', fg='#cbd5e0', relief='flat', bd=0,
                                insertbackground='white', padx=6, pady=4)
@@ -1404,7 +1481,11 @@ class App:
         win.grab_set()
         win.geometry('620x880')
         win.configure(bg=BG)
-        frm = ttk.Frame(win, padding=16)
+        head = tk.Frame(win, bg=BG)
+        head.pack(fill='x', padx=18, pady=(14, 0))
+        tk.Label(head, text='设置', bg=BG, fg=TEXT,
+                 font=('Microsoft YaHei UI', 15, 'bold')).pack(anchor='w')
+        frm = ttk.Frame(win, padding=(18, 10, 18, 16))
         frm.pack(fill='both', expand=True)
         vals = {}
         rows = (('http_port', 'HTTP 端口'), ('socks_port', 'SOCKS 端口'), ('stats_port', '统计 API 端口'))
@@ -1663,9 +1744,8 @@ class DownloaderWindow(tk.Toplevel):
         ttk.Checkbutton(r1, text='走代理', variable=self.proxy_var).pack(side='left')
         default_backend = app.cfg.get('dl_backend') or ('aria2' if dl.aria2_path() else 'curl')
         self.backend_var = tk.BooleanVar(value=(default_backend == 'aria2'))
-        tk.Checkbutton(r1, text='多连接(aria2)', variable=self.backend_var, bg=CARD,
-                       fg='#4a5568', activebackground=CARD,
-                       font=('Microsoft YaHei UI', 9)).pack(side='left', padx=(8, 0))
+        ttk.Checkbutton(r1, text='多连接(aria2)', variable=self.backend_var,
+                        style='Card.TCheckbutton').pack(side='left', padx=(8, 0))
         self.threads_var = tk.IntVar(value=int(app.cfg.get('dl_threads', 8)))
         tk.Label(r1, text='线程', bg=CARD, fg='#4a5568').pack(side='left', padx=(8, 2))
         ttk.Spinbox(r1, from_=1, to=16, width=4, textvariable=self.threads_var).pack(side='left')
@@ -1729,8 +1809,10 @@ class DownloaderWindow(tk.Toplevel):
         self._init_log_tags(self.log_box, self.log_box)
         logbar = tk.Frame(logtab, bg=CARD)
         logbar.pack(side='right', fill='y')
-        ttk.Button(logbar, text='清空', command=self.clear_dl_log).pack(fill='x', pady=2)
-        ttk.Button(logbar, text='打开文件', command=self.open_dl_log_file).pack(fill='x', pady=2)
+        ttk.Button(logbar, text='清空', style='Ghost.TButton',
+                   command=self.clear_dl_log).pack(fill='x', pady=2)
+        ttk.Button(logbar, text='打开文件', style='Ghost.TButton',
+                   command=self.open_dl_log_file).pack(fill='x', pady=2)
 
         histtab = tk.Frame(nb, bg=CARD)
         nb.add(histtab, text=' 下载记录 ')
@@ -2222,6 +2304,10 @@ class DownloaderWindow(tk.Toplevel):
 
 def main():
     core.kill_stale()
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SteadyLink.NodeManager.1')
+    except Exception:
+        pass
     root = tk.Tk()
     App(root)
     root.mainloop()
