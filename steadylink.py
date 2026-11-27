@@ -13,6 +13,7 @@ sys.path.insert(0, HERE)
 import v2core as core
 import downloader as dl
 import cleanip
+import ipscore
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -422,11 +423,24 @@ class App:
 
     def _score_ip(self, ip):
         try:
-            return cleanip.full_check(ip, proxy=self._proxy_url(),
-                                      key=self.cfg.get('cleanip_key', ''))
+            r = cleanip.full_check(ip, proxy=self._proxy_url(),
+                                   key=self.cfg.get('cleanip_key', ''))
         except Exception as e:
             self.log(f'IP 评分失败：{e}')
             return None
+        try:
+            if r and r.get('score') is not None:
+                hist = ipscore.record_score(ip, r['score'], r.get('grade', ''),
+                                            r.get('source', 'local'))
+                r['history'] = hist
+                delta = hist.get('delta')
+                if delta is not None and delta <= -10:
+                    self.log(f'⚠ IP 评分下降 {abs(delta)} 分'
+                             f'（{hist.get("prev_score")} → {r["score"]}，上次 {hist.get("prev_time")}）：'
+                             f'可能新增黑名单/滥用记录，或被同出口的其他用户牵连')
+        except Exception:
+            pass
+        return r
 
     def _auto_ip_check(self):
         d = core.ip_health(self.cfg['http_port'])
@@ -503,6 +517,13 @@ class App:
                  bg=CARD, fg=color, font=('Microsoft YaHei UI', 40, 'bold')).pack(anchor='w')
         tk.Label(left, text=f"等级 {grade or '?'}   ·   {src}", bg=CARD, fg=MUTED,
                  font=('Microsoft YaHei UI', 9)).pack(anchor='w')
+        hist = r.get('history') or {}
+        if hist.get('delta') is not None:
+            dlt = hist['delta']
+            arrow = '▲' if dlt > 0 else '▼'
+            hc = OKC if dlt > 0 else ERRC
+            tk.Label(left, text=f"{arrow} 较上次 {dlt:+d} 分（上次 {hist.get('prev_score')} · {hist.get('prev_time') or ''}）",
+                     bg=CARD, fg=hc, font=('Microsoft YaHei UI', 8)).pack(anchor='w', pady=(2, 0))
         mid = tk.Frame(hi, bg=CARD)
         mid.pack(side='left', padx=(26, 0), fill='x', expand=True)
         tk.Label(mid, text=f"出口 IP  {d.get('query') or loc.get('country_code') or '?'}",

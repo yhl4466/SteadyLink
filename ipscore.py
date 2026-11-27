@@ -11,7 +11,9 @@
 """
 import concurrent.futures as cf
 import json
+import os
 import socket
+import time
 
 from cleanip import _curl
 
@@ -36,13 +38,17 @@ HOSTING_WORDS = (
 )
 
 
-def _get_json(url, proxy, timeout=8):
-    try:
-        r = _curl(['--max-time', str(timeout), '-x', proxy, url] if proxy else
-                  ['--max-time', str(timeout), url], timeout=timeout + 4)
-        return json.loads(r.stdout or '{}')
-    except Exception:
-        return {}
+def _get_json(url, proxy, timeout=8, retries=2):
+    for _ in range(max(1, retries)):
+        try:
+            r = _curl(['--max-time', str(timeout), '-x', proxy, url] if proxy else
+                      ['--max-time', str(timeout), url], timeout=timeout + 4)
+            data = json.loads(r.stdout or '{}')
+            if data:
+                return data
+        except Exception:
+            pass
+    return {}
 
 
 def _dnsbl_hits(ip):
@@ -164,6 +170,23 @@ def score(ev):
         findings.append({'code': 'idc', 'desc': '机房/IDC 地址，最终分上限 75', 'delta': 0})
         pts = min(pts, 75)
 
+    a0 = ev.get('ipapi') or {}
+    b0 = ev.get('ipapi_is') or {}
+    have_geo = bool(a0) or bool(b0)
+    if not have_geo:
+        return {
+            'source': 'local', 'score': None, 'grade': '待评估', 'ip_type': '未知',
+            'native': None, 'broadcast': None, 'flags': flags, 'findings': findings,
+            'scenarios': {}, 'location': {}, 'network': {},
+            'report_url': f'https://cleanip.io/{ev.get("ip", "")}',
+            'coverage': '关键数据源不可用',
+            'note': 'ip-api 与 ipapi.is 均不可用，证据不足，暂不评分（可重试或配置 CleanIP 密钥）',
+            'raw': ev,
+        }
+    if not a0 or not b0:
+        pts = min(pts, 70)
+        findings.append({'code': 'coverage', 'desc': '部分数据源不可用，评分置信度较低（上限 70）',
+                         'delta': 0})
     pts = max(0, min(100, pts))
     ip_type = ('机房/IDC' if flags['hosting'] else
                ('Tor' if flags['tor'] else ('VPN' if flags['vpn'] else
@@ -197,6 +220,50 @@ def score(ev):
                     + (f'（缺失：{", ".join(ev.get("errors") or [])}）' if ev.get('errors') else ''),
         'raw': ev,
     }
+
+
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'IP评分历史.json')
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(hist):
+    try:
+        tmp = HISTORY_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(hist[-800:], f, ensure_ascii=False)
+        os.replace(tmp, HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def record_score(ip, score, grade, source='local'):
+    """记录一次评分，返回与上一次（同 IP、同来源）的对比。"""
+    hist = load_history()
+    prev = None
+    for rec in reversed(hist):
+        if (rec.get('ip') == ip and rec.get('source') == source
+                and rec.get('score') is not None):
+            prev = rec
+            break
+    rec = {'ip': ip, 'score': score, 'grade': grade, 'source': source,
+           'ts': time.time(), 'time': time.strftime('%Y-%m-%d %H:%M:%S')}
+    hist.append(rec)
+    save_history(hist)
+    out = {'prev_score': None, 'prev_grade': None, 'prev_time': None, 'delta': None}
+    if prev:
+        out.update(prev_score=prev.get('score'), prev_grade=prev.get('grade'),
+                   prev_time=prev.get('time'))
+        if score is not None and prev.get('score') is not None:
+            out['delta'] = int(score) - int(prev['score'])
+    return out
 
 
 def check(ip, proxy=None):

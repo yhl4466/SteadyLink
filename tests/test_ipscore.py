@@ -11,7 +11,10 @@ def base_ev(**kw):
                   'country': '美国', 'countryCode': 'US', 'regionName': 'California',
                   'city': 'Los Angeles', 'isp': 'Comcast', 'org': 'Comcast',
                   'as': 'AS7922 Comcast', 'timezone': 'America/Los_Angeles'},
-        'ipapi_is': {},
+        'ipapi_is': {'is_datacenter': False, 'is_proxy': False, 'is_vpn': False,
+                     'is_tor': False, 'is_abuser': False, 'is_crawler': False,
+                     'asn': {'type': 'isp', 'name': 'Comcast'},
+                     'company': {'type': 'isp', 'name': 'Comcast'}},
         'ptr': 'c-1-2-3-4.hsd1.ca.comcast.net',
         'dnsbl': [],
         'sources': ['ip-api', 'ipapi.is', 'DNSBL'],
@@ -34,6 +37,34 @@ class GradeTest(unittest.TestCase):
         self.assertEqual(ipscore.grade_of(45), 'D')
         self.assertEqual(ipscore.grade_of(21), 'D')
         self.assertEqual(ipscore.grade_of(20), 'F')
+
+
+class HistoryTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile, os
+        self.tmp = tempfile.mkdtemp(prefix='st-hist-')
+        self.old = ipscore.HISTORY_FILE
+        ipscore.HISTORY_FILE = os.path.join(self.tmp, 'hist.json')
+
+    def tearDown(self):
+        import shutil
+        ipscore.HISTORY_FILE = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_first_record_has_no_delta(self):
+        h = ipscore.record_score('1.2.3.4', 81, 'A', 'cleanip')
+        self.assertIsNone(h['delta'])
+
+    def test_drop_computes_negative_delta(self):
+        ipscore.record_score('1.2.3.4', 81, 'A', 'cleanip')
+        h = ipscore.record_score('1.2.3.4', 30, 'D', 'cleanip')
+        self.assertEqual(h['delta'], -51)
+        self.assertEqual(h['prev_score'], 81)
+
+    def test_different_source_not_compared(self):
+        ipscore.record_score('1.2.3.4', 81, 'A', 'cleanip')
+        h = ipscore.record_score('1.2.3.4', 75, 'B', 'local')
+        self.assertIsNone(h['delta'])
 
 
 class ScoreTest(unittest.TestCase):
@@ -88,6 +119,17 @@ class ScoreTest(unittest.TestCase):
                             'as': 'AS24940 Hetzner'})
         r = ipscore.score(ev)
         self.assertTrue(r['flags']['hosting'])
+
+    def test_no_sources_means_unrated(self):
+        ev = base_ev(ipapi={}, ipapi_is={}, ptr='', sources=[], errors=['ip-api', 'ipapi.is'])
+        r = ipscore.score(ev)
+        self.assertIsNone(r['score'])
+        self.assertEqual(r['grade'], '待评估')
+
+    def test_single_source_capped(self):
+        ev = base_ev(ipapi_is={}, errors=['ipapi.is'])
+        r = ipscore.score(ev)
+        self.assertLessEqual(r['score'], 70)
 
     def test_score_never_negative(self):
         ev = base_ev(ipapi_is={'is_tor': True, 'is_abuser': True, 'is_proxy': True},

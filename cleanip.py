@@ -16,7 +16,7 @@ UA = 'SteadyLink/1.0 (+https://github.com/yhl4466/SteadyLink)'
 
 
 def _curl(args, timeout=30):
-    return subprocess.run(['curl.exe', '-sS', '--ssl-no-revoke', '--max-time', str(timeout),
+    return subprocess.run(['curl.exe', '-sS', '-L', '--ssl-no-revoke', '--max-time', str(timeout),
                            '-A', UA] + args, capture_output=True, text=True,
                           timeout=timeout + 10, creationflags=CREATE, errors='replace')
 

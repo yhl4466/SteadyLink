@@ -242,3 +242,5 @@ download.log
 *.tmp
 
 连接历史.json
+
+IP评分历史.json
