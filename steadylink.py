@@ -14,6 +14,7 @@ import v2core as core
 import downloader as dl
 import cleanip
 import ipscore
+import scoring
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -109,12 +110,23 @@ OKC = '#16a34a'
 WARNC = '#d97706'
 ERRC = '#dc2626'
 
-COLS = ('remark', 'addr', 'port', 'proto', 'lat', 'ip', 'loc', 'state')
+COLS = ('remark', 'addr', 'port', 'proto', 'lat', 'score', 'ip', 'loc', 'state')
 HEADS = {'remark': '别名', 'addr': '地址', 'port': '端口', 'proto': '协议',
-         'lat': '延迟', 'ip': '出口IP', 'loc': '地区', 'state': '状态'}
-WIDTHS = {'remark': 210, 'addr': 210, 'port': 65, 'proto': 70,
-          'lat': 85, 'ip': 145, 'loc': 55, 'state': 95}
-SORTABLE = ('remark', 'addr', 'port', 'proto', 'lat', 'ip', 'loc', 'state')
+         'lat': '延迟', 'score': '评分', 'ip': '出口IP', 'loc': '地区', 'state': '状态'}
+WIDTHS = {'remark': 200, 'addr': 200, 'port': 60, 'proto': 65, 'lat': 80,
+          'score': 72, 'ip': 140, 'loc': 50, 'state': 90}
+SORTABLE = ('remark', 'addr', 'port', 'proto', 'lat', 'score', 'ip', 'loc', 'state')
+SORT_CHOICES = {'延迟': ('lat', False), '评分': ('score', True),
+                '国家': ('loc', False), '名称': ('remark', False),
+                '出口 IP': ('ip', False)}
+
+
+def score_text(n):
+    s = n.get('score')
+    if s is None:
+        return '—'
+    g = n.get('grade') or ''
+    return f'{s} {g}'.strip()
 
 
 class App:
@@ -214,6 +226,9 @@ class App:
                      font=('Microsoft YaHei UI', 9))
         st.map('TCheckbutton', background=[('active', BG)])
         st.map('Card.TCheckbutton', background=[('active', CARD)])
+        st.configure('Card.TRadiobutton', background=CARD, foreground=TEXT,
+                     font=('Microsoft YaHei UI', 9))
+        st.map('Card.TRadiobutton', background=[('active', CARD)])
         st.configure('TEntry', fieldbackground='white', padding=5)
         st.configure('TCombobox', padding=4)
         st.configure('TSeparator', background=BORDER)
@@ -224,6 +239,9 @@ class App:
         st.map('Treeview', background=[('selected', '#dbeafe')],
                foreground=[('selected', '#0f172a')])
         st.map('Treeview.Heading', background=[('active', '#e8eef8')])
+        st.configure('Horizontal.TProgressbar', background=ACCENT,
+                     troughcolor='#e8edf5', bordercolor='#e8edf5',
+                     lightcolor=ACCENT, darkcolor=ACCENT, thickness=10)
         st.configure('TScrollbar', background='#e8edf5', arrowcolor=MUTED,
                      borderwidth=0, troughcolor='#f7f9fd')
         self._setup_check_images(st)
@@ -327,6 +345,15 @@ class App:
         ttk.Entry(info, textvariable=self.filter_text, width=30).pack(side='left', padx=6)
         tk.Label(info, textvariable=self.count_var, bg=BG, fg=MUTED,
                  font=('Microsoft YaHei UI', 9)).pack(side='right')
+        ttk.Button(info, text='⭐ 全节点评分', style='Ghost.TButton',
+                   command=self.open_scoring).pack(side='right', padx=(10, 0))
+        self.sort_choice = tk.StringVar(value='延迟')
+        cb_sort = ttk.Combobox(info, textvariable=self.sort_choice,
+                               values=list(SORT_CHOICES), width=8, state='readonly')
+        cb_sort.pack(side='right', padx=(6, 8))
+        cb_sort.bind('<<ComboboxSelected>>', lambda e: self._apply_sort_choice())
+        tk.Label(info, text='排序', bg=BG, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9, 'bold')).pack(side='right')
 
         # ---- 状态栏（底部）----
         sb = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -388,6 +415,9 @@ class App:
         inner_card.columnconfigure(0, weight=1)
         self.tree.tag_configure('odd', background=CARD)
         self.tree.tag_configure('even', background='#f8fafc')
+        self.tree.tag_configure('score_high', foreground=OKC)
+        self.tree.tag_configure('score_low', foreground=ERRC)
+        self.tree.tag_configure('score_mid', foreground=WARNC)
         self.tree.tag_configure('connected', background='#e6fffa', foreground=OKC)
         self.tree.tag_configure('dead', foreground='#c53030')
         self.tree.bind('<Double-1>', lambda e: self.connect_selected())
@@ -983,6 +1013,11 @@ class App:
         if col == 'lat':
             lat = n.get('lat')
             return (lat is None, lat if lat else 0)
+        if col == 'score':
+            s = n.get('score')
+            return (s is None, s or 0)
+        if col == 'loc':
+            return self.region_of(n)
         if col == 'port':
             return (n.get('port') or 0)
         if col == 'state':
@@ -996,8 +1031,16 @@ class App:
         if self.sort_col == col:
             self.sort_desc = not self.sort_desc
         else:
-            self.sort_col, self.sort_desc = col, False
+            self.sort_col, self.sort_desc = col, (col in ('score',))
         self.refresh()
+
+    def _apply_sort_choice(self):
+        col, desc = SORT_CHOICES.get(self.sort_choice.get(), ('lat', False))
+        self.sort_col, self.sort_desc = col, desc
+        self.refresh()
+
+    def open_scoring(self):
+        ScoringDialog(self)
 
     def _visible_indexes(self):
         idx = list(range(len(self.nodes)))
@@ -1031,15 +1074,15 @@ class App:
             n = self.nodes[i]
             state, tag = self._state_text(n)
             if tag == 'connected':
-                tags = ('connected',)
+                tags = ['connected']
             elif tag == 'dead':
-                tags = ('dead',)
+                tags = ['dead']
             else:
-                tags = ('even' if i % 2 else 'odd',)
+                tags = ['even' if i % 2 else 'odd']
             lat = f"{n['lat']}ms" if n.get('lat') else '—'
-            self.tree.insert('', 'end', iid=str(i), tags=tags, values=(
+            self.tree.insert('', 'end', iid=str(i), tags=tuple(tags), values=(
                 n.get('remark', '')[:42], n.get('addr', ''), n.get('port', ''),
-                n.get('proto', ''), lat, n.get('ip', '') or '—',
+                n.get('proto', ''), lat, score_text(n), n.get('ip', '') or '—',
                 n.get('loc', '') or self.region_of(n), state))
         if sel_iid and self.tree.exists(sel_iid):
             self.tree.selection_set(sel_iid)
@@ -1877,6 +1920,246 @@ class App:
         except Exception:
             pass
 
+
+
+class ScoringDialog(tk.Toplevel):
+    """全节点一键评分：并发给所有节点 IP 打分并显示汇总表。"""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title('全节点评分')
+        self.geometry('1040x760')
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.stop = threading.Event()
+        self.running = False
+        self.done = 0
+        self.total = 0
+        self.logq = queue.Queue()
+        self.rows = []
+        self.sort_col = 'score'
+        self.sort_desc = True
+
+        head = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        head.pack(fill='x', padx=10, pady=(10, 6))
+        hi = tk.Frame(head, bg=CARD, padx=14, pady=10)
+        hi.pack(fill='x')
+        tk.Label(hi, text='全节点 IP 评分', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 14, 'bold')).pack(anchor='w')
+        tk.Label(hi, text='对机场里所有节点当前的出口 IP 评分；缺 IP 的节点会跳过（先测延迟/更新订阅可补全）',
+                 bg=CARD, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w')
+
+        opts = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        opts.pack(fill='x', padx=10, pady=(0, 6))
+        oi = tk.Frame(opts, bg=CARD, padx=14, pady=9)
+        oi.pack(fill='x')
+        self.mode = tk.StringVar(value='local')
+        has_key = bool(app.cfg.get('cleanip_key'))
+        tk.Label(oi, text='评分方式', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left')
+        ttk.Radiobutton(oi, text='本地估算（免费）', value='local',
+                        variable=self.mode, style='Card.TRadiobutton').pack(side='left', padx=8)
+        rb_off = ttk.Radiobutton(oi, text='CleanIP 官方（消耗配额）', value='official',
+                                 variable=self.mode, style='Card.TRadiobutton')
+        rb_off.pack(side='left', padx=(0, 8))
+        if not has_key:
+            rb_off.configure(state='disabled')
+            tk.Label(oi, text='（未配置密钥）', bg=CARD, fg=MUTED,
+                     font=('Microsoft YaHei UI', 8)).pack(side='left')
+        tk.Label(oi, text='并发', bg=CARD, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9)).pack(side='left', padx=(14, 2))
+        self.workers_var = tk.IntVar(value=4)
+        ttk.Spinbox(oi, from_=1, to=8, width=4, textvariable=self.workers_var).pack(side='left')
+        self.btn_start = ttk.Button(oi, text='开始评分', style='Primary.TButton',
+                                    command=self.start)
+        self.btn_start.pack(side='right')
+        self.btn_stop = ttk.Button(oi, text='停止', style='Ghost.TButton',
+                                   command=self.stop_run)
+        self.btn_stop.pack(side='right', padx=6)
+        self.btn_stop.configure(state='disabled')
+
+        self.progress = ttk.Progressbar(self, mode='determinate', maximum=100)
+        self.progress.pack(fill='x', padx=10, pady=(0, 2))
+        self.status = tk.StringVar(value='准备就绪')
+        tk.Label(self, textvariable=self.status, bg=BG, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9), anchor='w').pack(fill='x', padx=12, pady=(0, 4))
+
+        wrap = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+        inner = tk.Frame(wrap, bg=CARD, padx=6, pady=6)
+        inner.pack(fill='both', expand=True)
+        cols = ('remark', 'country', 'ip', 'score', 'grade', 'type', 'flags', 'source', 'time')
+        heads = {'remark': '节点', 'country': '国家/地区', 'ip': '出口 IP', 'score': '评分',
+                 'grade': '等级', 'type': '类型', 'flags': '标记', 'source': '来源', 'time': '时间'}
+        widths = {'remark': 170, 'country': 90, 'ip': 130, 'score': 60, 'grade': 55,
+                  'type': 90, 'flags': 120, 'source': 80, 'time': 140}
+        self.tree = ttk.Treeview(inner, columns=cols, show='headings', selectmode='browse')
+        for c in cols:
+            self.tree.heading(c, text=heads[c], command=lambda c=c: self._sort(c))
+            self.tree.column(c, width=widths[c], anchor='w' if c in ('remark', 'ip', 'flags') else 'center')
+        vs = ttk.Scrollbar(inner, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vs.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vs.grid(row=0, column=1, sticky='ns')
+        inner.rowconfigure(0, weight=1)
+        inner.columnconfigure(0, weight=1)
+        self.tree.tag_configure('good', foreground=OKC)
+        self.tree.tag_configure('bad', foreground=ERRC)
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill='x', padx=12, pady=(0, 10))
+        ttk.Button(bar, text='导出 CSV', style='Ghost.TButton',
+                   command=self.export_csv).pack(side='left')
+        ttk.Button(bar, text='关闭', command=self.on_close).pack(side='right')
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.after(250, self._tick)
+
+    # ---- 运行 ----
+    def start(self):
+        if self.running:
+            return
+        official = self.mode.get() == 'official'
+        if official and not self.app.cfg.get('cleanip_key'):
+            messagebox.showinfo('全节点评分', '请先在设置 → 高级 / IP 评分 里配置 CleanIP 密钥', parent=self)
+            return
+        nodes = self.app.nodes
+        targets = [n for n in nodes if str(n.get('ip') or '').strip()]
+        if not targets:
+            messagebox.showinfo('全节点评分', '没有可评分的节点：请先更新订阅或做一次测延迟以获取出口 IP', parent=self)
+            return
+        if official and len({n.get('ip') for n in targets}) > 20:
+            if not messagebox.askyesno('全节点评分',
+                                       f'官方评分会对 {len(targets)} 个不同 IP 计费，免费额度只有 20 个/天，'
+                                       '超出会失败。继续？', parent=self):
+                return
+        self.stop.clear()
+        self.running = True
+        self.done = 0
+        self.total = len(targets)
+        self.progress.configure(maximum=max(1, self.total), value=0)
+        self.tree.delete(*self.tree.get_children())
+        self.btn_start.configure(state='disabled')
+        self.btn_stop.configure(state='normal')
+        self.status.set(f'评分中… 0/{self.total}')
+        proxy = self.app._proxy_url() if self.app.core.running() else None
+        try:
+            workers = max(1, int(self.workers_var.get() or 4))
+        except Exception:
+            workers = 4
+
+        def progress(done, total, node, r):
+            self.logq.put((done, total, node, r))
+
+        def run():
+            stats = scoring.score_nodes(
+                nodes, official=official, key=self.app.cfg.get('cleanip_key', ''),
+                proxy=proxy, workers=workers,
+                progress=progress, stop=self.stop)
+            self.logq.put(('finish', stats))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def stop_run(self):
+        self.stop.set()
+        self.status.set('正在停止…')
+
+    def _tick(self):
+        try:
+            while True:
+                item = self.logq.get_nowait()
+                if isinstance(item[0], str) and item[0] == 'finish':
+                    self._finish(item[1])
+                else:
+                    done, total, node, r = item
+                    self.done = done
+                    self.progress.configure(value=done)
+                    self.status.set(f'评分中… {done}/{total}')
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(250, self._tick)
+
+    def _finish(self, stats):
+        self.running = False
+        self.btn_start.configure(state='normal')
+        self.btn_stop.configure(state='disabled')
+        self.app.save()
+        self.app.refresh()
+        self._reload_rows()
+        self.status.set(
+            f"完成：成功 {stats.get('scored', 0)}，失败 {stats.get('failed', 0)}，"
+            f"跳过（无出口 IP）{stats.get('skipped', 0)}"
+            + ('（已停止）' if stats.get('stopped') else ''))
+
+    # ---- 汇总表 ----
+    def _reload_rows(self):
+        rows = []
+        for n in self.app.nodes:
+            if n.get('score') is None and not n.get('score_note'):
+                continue
+            rows.append(n)
+        def key(n):
+            if self.sort_col == 'score':
+                v = n.get('score')
+                return (v is None, v or 0)
+            if self.sort_col == 'grade':
+                return (n.get('grade') or '')
+            if self.sort_col == 'country':
+                return self.app.region_of(n)
+            return str(n.get(self.sort_col) or '').lower()
+        rows.sort(key=key, reverse=self.sort_desc)
+        self.tree.delete(*self.tree.get_children())
+        for n in rows:
+            flags = n.get('score_flags') or {}
+            marks = ''.join(t for t, on in (('代理', flags.get('proxy')), ('VPN', flags.get('vpn')),
+                                            ('Tor', flags.get('tor')), ('机房', flags.get('hosting')),
+                                            ('滥用', flags.get('abuse'))) if on) or '—'
+            ts = n.get('score_time')
+            tstr = time.strftime('%m-%d %H:%M', time.localtime(ts)) if ts else '—'
+            try:
+                tag = 'good' if (n.get('score') or 0) >= 81 else ('bad' if (n.get('score') or 100) < 46 else '')
+            except Exception:
+                tag = ''
+            self.tree.insert('', 'end', values=(
+                n.get('remark', '')[:30], self.app.region_of(n), n.get('ip') or '—',
+                n.get('score') if n.get('score') is not None else '—',
+                n.get('grade') or '—', n.get('score_type') or '—', marks,
+                'CleanIP' if n.get('score_source') == 'cleanip' else ('本地' if n.get('score_source') else '—'),
+                tstr), tags=(tag,) if tag else ())
+
+    def _sort(self, col):
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = col in ('score', 'grade')
+        self._reload_rows()
+
+    def export_csv(self):
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(defaultextension='.csv',
+                                                initialfile='IP评分汇总.csv',
+                                                filetypes=[('CSV', '*.csv')])
+            if not path:
+                return
+            import csv as _csv
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = _csv.writer(f)
+                w.writerow(['节点', '国家/地区', '出口IP', '评分', '等级', '类型', '标记', '来源', '时间'])
+                for iid in self.tree.get_children():
+                    w.writerow(self.tree.item(iid, 'values'))
+            self.status.set('已导出：' + path)
+        except Exception as e:
+            messagebox.showerror('导出失败', str(e), parent=self)
+
+    def on_close(self):
+        self.stop.set()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 class DownloaderWindow(tk.Toplevel):
