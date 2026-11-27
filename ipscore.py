@@ -13,7 +13,9 @@ import concurrent.futures as cf
 import json
 import os
 import socket
+import threading
 import time
+import urllib.parse
 
 from cleanip import _curl
 
@@ -38,17 +40,41 @@ HOSTING_WORDS = (
 )
 
 
+_THROTTLE_LOCK = threading.Lock()
+_LAST_CALL = {}
+MIN_GAP = {'ip-api.com': 1.5, 'ipapi.is': 1.2}
+
+
+def _throttle(url):
+    """同一数据源限制调用频率，避免免费额度/速率限制导致批量评分全部失败。"""
+    host = urllib.parse.urlparse(url).hostname or ''
+    gap = MIN_GAP.get(host, 0.8)
+    with _THROTTLE_LOCK:
+        now = time.time()
+        slot = max(now, _LAST_CALL.get(host, 0.0) + gap)
+        _LAST_CALL[host] = slot
+    wait = slot - time.time()
+    if wait > 0:
+        time.sleep(wait)
+
+
 def _get_json(url, proxy, timeout=8, retries=2):
-    for _ in range(max(1, retries)):
+    """返回 (dict, error)。只接受 JSON 对象；字符串/HTML/429 都算失败并重试。"""
+    last_err = ''
+    for attempt in range(max(1, retries)):
+        _throttle(url)
         try:
             r = _curl(['--max-time', str(timeout), '-x', proxy, url] if proxy else
                       ['--max-time', str(timeout), url], timeout=timeout + 4)
-            data = json.loads(r.stdout or '{}')
-            if data:
-                return data
-        except Exception:
-            pass
-    return {}
+            raw = r.stdout or ''
+            data = json.loads(raw)
+            if isinstance(data, dict) and data:
+                return data, ''
+            last_err = f'响应不是 JSON 对象（{str(raw)[:60]}）'
+        except Exception as e:
+            last_err = str(e)[:100] or '请求失败'
+        time.sleep(1.2 * (attempt + 1))
+    return {}, last_err
 
 
 def _dnsbl_hits(ip):
@@ -71,19 +97,21 @@ def _dnsbl_hits(ip):
 def collect(ip, proxy=None):
     """采集免费来源的数据（每个来源失败不影响其它来源）。"""
     ev = {'ip': ip, 'sources': [], 'errors': []}
-    a = _get_json(f'http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,'
-                  f'city,isp,org,as,asname,proxy,hosting,mobile,timezone,reverse', proxy)
+    a, a_err = _get_json(f'http://ip-api.com/json/{ip}?fields=status,country,countryCode,'
+                         f'regionName,city,isp,org,as,asname,proxy,hosting,mobile,timezone,reverse',
+                         proxy)
     if a.get('status') == 'success':
         ev['ipapi'] = a
         ev['sources'].append('ip-api')
     else:
-        ev['errors'].append('ip-api')
-    b = _get_json(f'https://ipapi.is/json/?q={ip}', proxy, timeout=10)
+        ev['errors'].append('ip-api' + (f': {a_err}' if a_err else
+                                        (f': {a.get("message")}' if a.get('message') else '')))
+    b, b_err = _get_json(f'https://ipapi.is/json/?q={ip}', proxy, timeout=10)
     if b:
         ev['ipapi_is'] = b
         ev['sources'].append('ipapi.is')
     else:
-        ev['errors'].append('ipapi.is')
+        ev['errors'].append('ipapi.is' + (f': {b_err}' if b_err else ''))
     try:
         reverse = socket.gethostbyaddr(ip)[0]
     except Exception:
@@ -180,7 +208,9 @@ def score(ev):
             'scenarios': {}, 'location': {}, 'network': {},
             'report_url': f'https://cleanip.io/{ev.get("ip", "")}',
             'coverage': '关键数据源不可用',
-            'note': 'ip-api 与 ipapi.is 均不可用，证据不足，暂不评分（可重试或配置 CleanIP 密钥）',
+            'note': '评分失败：ip-api 与 ipapi.is 均不可用'
+                    + (f'（{"; ".join((ev.get("errors") or [])[:2])}）' if ev.get('errors') else '')
+                    + '；请连接一个节点后重试，或配置 CleanIP 密钥',
             'raw': ev,
         }
     if not a0 or not b0:

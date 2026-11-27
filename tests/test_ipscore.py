@@ -131,6 +131,32 @@ class ScoreTest(unittest.TestCase):
         r = ipscore.score(ev)
         self.assertLessEqual(r['score'], 70)
 
+    def test_get_json_rejects_non_object(self):
+        orig_curl = ipscore._curl
+        orig_throttle = ipscore._throttle
+        ipscore._throttle = lambda url: None
+        ipscore._curl = lambda args, timeout=0: type('R', (), {'stdout': '"Too Many Requests"'})()
+        try:
+            data, err = ipscore._get_json('http://ip-api.com/json/1.2.3.4', None, retries=1)
+            self.assertEqual(data, {})
+            self.assertIn('不是 JSON 对象', err)
+        finally:
+            ipscore._curl = orig_curl
+            ipscore._throttle = orig_throttle
+
+    def test_get_json_accepts_object(self):
+        orig_curl = ipscore._curl
+        orig_throttle = ipscore._throttle
+        ipscore._throttle = lambda url: None
+        ipscore._curl = lambda args, timeout=0: type('R', (), {'stdout': '{"status":"success"}'})()
+        try:
+            data, err = ipscore._get_json('http://ip-api.com/json/1.2.3.4', None, retries=1)
+            self.assertEqual(data, {'status': 'success'})
+            self.assertEqual(err, '')
+        finally:
+            ipscore._curl = orig_curl
+            ipscore._throttle = orig_throttle
+
     def test_score_never_negative(self):
         ev = base_ev(ipapi_is={'is_tor': True, 'is_abuser': True, 'is_proxy': True},
                      dnsbl=[{'zone': z, 'name': n} for z, n in ipscore.DNSBL])

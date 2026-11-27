@@ -41,6 +41,7 @@ class BatchScoreTest(unittest.TestCase):
         self.assertEqual(nodes[0]['score'], 80)
         self.assertEqual(nodes[0]['grade'], 'B')
         self.assertEqual(nodes[0]['score_source'], 'local')
+        self.assertIn('失败', nodes[2].get('score_note', ''))
         self.assertIn('quota', nodes[2].get('score_note', ''))
         self.assertIsNone(nodes[1].get('score'))
 

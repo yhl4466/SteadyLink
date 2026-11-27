@@ -1929,7 +1929,7 @@ class ScoringDialog(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title('全节点评分')
-        self.geometry('1040x760')
+        self.geometry('1200x760')
         self.configure(bg=BG)
         self.transient(app.root)
         self.stop = threading.Event()
@@ -1989,19 +1989,23 @@ class ScoringDialog(tk.Toplevel):
         wrap.pack(fill='both', expand=True, padx=10, pady=(0, 6))
         inner = tk.Frame(wrap, bg=CARD, padx=6, pady=6)
         inner.pack(fill='both', expand=True)
-        cols = ('remark', 'country', 'ip', 'score', 'grade', 'type', 'flags', 'source', 'time')
+        cols = ('remark', 'country', 'ip', 'score', 'grade', 'type', 'flags',
+                'source', 'time', 'note')
         heads = {'remark': '节点', 'country': '国家/地区', 'ip': '出口 IP', 'score': '评分',
-                 'grade': '等级', 'type': '类型', 'flags': '标记', 'source': '来源', 'time': '时间'}
-        widths = {'remark': 170, 'country': 90, 'ip': 130, 'score': 60, 'grade': 55,
-                  'type': 90, 'flags': 120, 'source': 80, 'time': 140}
+                 'grade': '等级', 'type': '类型', 'flags': '标记', 'source': '来源',
+                 'time': '时间', 'note': '备注'}
+        widths = {'remark': 140, 'country': 80, 'ip': 120, 'score': 55, 'grade': 50,
+                  'type': 75, 'flags': 95, 'source': 60, 'time': 95, 'note': 260}
         self.tree = ttk.Treeview(inner, columns=cols, show='headings', selectmode='browse')
         for c in cols:
             self.tree.heading(c, text=heads[c], command=lambda c=c: self._sort(c))
             self.tree.column(c, width=widths[c], anchor='w' if c in ('remark', 'ip', 'flags') else 'center')
         vs = ttk.Scrollbar(inner, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vs.set)
+        hs = ttk.Scrollbar(inner, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         self.tree.grid(row=0, column=0, sticky='nsew')
         vs.grid(row=0, column=1, sticky='ns')
+        hs.grid(row=1, column=0, sticky='ew')
         inner.rowconfigure(0, weight=1)
         inner.columnconfigure(0, weight=1)
         self.tree.tag_configure('good', foreground=OKC)
@@ -2032,6 +2036,11 @@ class ScoringDialog(tk.Toplevel):
             if not messagebox.askyesno('全节点评分',
                                        f'官方评分会对 {len(targets)} 个不同 IP 计费，免费额度只有 20 个/天，'
                                        '超出会失败。继续？', parent=self):
+                return
+        if not self.app.core.running():
+            if not messagebox.askyesno('全节点评分',
+                                       '当前没有连接节点，评分将尝试直连；国内直连数据源可能失败。\n'
+                                       '建议先连接一个节点再评分。仍要继续吗？', parent=self):
                 return
         self.stop.clear()
         self.running = True
@@ -2087,10 +2096,12 @@ class ScoringDialog(tk.Toplevel):
         self.app.save()
         self.app.refresh()
         self._reload_rows()
-        self.status.set(
-            f"完成：成功 {stats.get('scored', 0)}，失败 {stats.get('failed', 0)}，"
-            f"跳过（无出口 IP）{stats.get('skipped', 0)}"
-            + ('（已停止）' if stats.get('stopped') else ''))
+        msg = (f"完成：成功 {stats.get('scored', 0)}，失败 {stats.get('failed', 0)}，"
+               f"跳过（无出口 IP）{stats.get('skipped', 0)}"
+               + ('（已停止）' if stats.get('stopped') else ''))
+        if stats.get('failed'):
+            msg += '；失败原因见备注列'
+        self.status.set(msg)
 
     # ---- 汇总表 ----
     def _reload_rows(self):
@@ -2121,12 +2132,13 @@ class ScoringDialog(tk.Toplevel):
                 tag = 'good' if (n.get('score') or 0) >= 81 else ('bad' if (n.get('score') or 100) < 46 else '')
             except Exception:
                 tag = ''
+            note = (n.get('score_note') or '')[:34]
             self.tree.insert('', 'end', values=(
                 n.get('remark', '')[:30], self.app.region_of(n), n.get('ip') or '—',
                 n.get('score') if n.get('score') is not None else '—',
                 n.get('grade') or '—', n.get('score_type') or '—', marks,
                 'CleanIP' if n.get('score_source') == 'cleanip' else ('本地' if n.get('score_source') else '—'),
-                tstr), tags=(tag,) if tag else ())
+                tstr, note), tags=(tag,) if tag else ())
 
     def _sort(self, col):
         if self.sort_col == col:
@@ -2257,9 +2269,11 @@ class DownloaderWindow(tk.Toplevel):
             self.tree.heading(c, text=heads[c])
             self.tree.column(c, width=widths[c], anchor='w' if c == 'name' else 'center')
         vs = ttk.Scrollbar(inner, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vs.set)
+        hs = ttk.Scrollbar(inner, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         self.tree.grid(row=0, column=0, sticky='nsew')
         vs.grid(row=0, column=1, sticky='ns')
+        hs.grid(row=1, column=0, sticky='ew')
         inner.rowconfigure(0, weight=1)
         inner.columnconfigure(0, weight=1)
         self.tree.tag_configure('ok', foreground=OKC)

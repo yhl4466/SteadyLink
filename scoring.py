@@ -60,7 +60,16 @@ def score_nodes(nodes, official=False, key='', proxy=None, workers=4,
                     n['score_time'] = time.time()
                     scored += 1
                 else:
-                    n['score_note'] = r.get('error') or r.get('note') or '评分失败'
+                    reason = str(r.get('error') or r.get('note') or '未知原因')
+                    if '429' in reason or '限流' in reason:
+                        short = '数据源限流（HTTP 429），连接节点后重试'
+                    elif '不是 JSON' in reason:
+                        short = '数据源返回异常（非 JSON），稍后重试'
+                    elif '均不可用' in reason:
+                        short = '数据源不可用，请连接节点后重试'
+                    else:
+                        short = reason[:40]
+                    n['score_note'] = '失败：' + short
                     failed += 1
             if progress:
                 try:
