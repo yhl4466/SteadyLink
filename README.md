@@ -17,6 +17,8 @@
 |---|---|
 | ![主界面](docs/screenshots/main.png) | ![下载器](docs/screenshots/downloader.png) |
 
+![IP 体检（纯净度评分）](docs/screenshots/ip-score.png)
+
 ![设置](docs/screenshots/settings.png)
 
 ![站点代理规则](docs/screenshots/rules.png)
@@ -94,6 +96,19 @@ python steadylink.py
 
 工具栏「导入订阅」粘贴机场订阅链接，或「从剪贴板导入」粘贴节点链接，然后选中节点点「连接」。
 
+## IP 纯净度评分
+
+IP 体检会给出 0–100 分与等级（91+ A+、81+ A、66+ B、46+ C、21+ D、其余 F），支持两种模式：
+
+| 模式 | 说明 |
+|---|---|
+| CleanIP 官方（推荐） | 在设置 →「高级 / IP 评分」填入 [CleanIP](https://cleanip.io/account?tab=api) 的 API 密钥（免费账户 20 个 IP/天）。使用其 MCP 接口，返回官方评分、类型、原生/广播、扣分依据与场景适配 |
+| 本地估算 | 未配置密钥时自动使用：ip-api + ipapi.is + 8 个 DNSBL + PTR 启发式；机房地址最终分上限 75，代理/VPN/Tor、黑名单、滥用记录按规则扣分 |
+
+本地估算与官方的差异：官方使用商业数据库、同 /24 邻居扫描与自建观测，本地只有免费来源，分数仅作参考（界面会标注「本地估算」并给出缺失来源）。
+
+隐私说明：查询会把**当前出口 IP** 发给上述数据源（CleanIP/ip-api/ipapi.is/DNSBL）；API 密钥只保存在本机 `config.json`（已在 `.gitignore` 中），不会上传。
+
 ## 下载速度与稳定性
 
 - 进度按磁盘实际写入字节统计（不再等分片完成才跳一次），速度/进度更平滑；
@@ -109,7 +124,7 @@ python steadylink.py
 python tests/run_tests.py -v
 ```
 
-覆盖：核心启动令牌（过期线程不误杀新进程）、自动重连并发/停止、系统代理备份与恢复、在线时长口径、HTTP 分段校验与回退、If-Range/ETag 变化检测、HLS AES-128/错误密钥/不支持加密、续传资源身份（URL/大小/ETag/密钥内容/IV/BYTERANGE/MAP 参与的 HLS 摘要）、断网续传回退。共 42 个用例。
+覆盖：核心启动令牌（过期线程不误杀新进程）、自动重连并发/停止、系统代理备份与恢复、在线时长口径、HTTP 分段校验与回退、If-Range/ETag 变化检测、HLS AES-128/错误密钥/不支持加密、续传资源身份（URL/大小/ETag/密钥内容/IV/BYTERANGE/MAP 参与的 HLS 摘要）、断网续传回退。共 62 个用例。
 
 详见 [tests/README.md](tests/README.md)。
 

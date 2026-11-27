@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
     'access_log': True,
     'allow_insecure': False,
     'auto_reconnect': True,
+    'cleanip_key': '',
 }
 
 os.makedirs(CFG_DIR, exist_ok=True)

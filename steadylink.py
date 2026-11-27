@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v2core as core
 import downloader as dl
+import cleanip
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -416,18 +417,31 @@ class App:
         except Exception:
             pass
 
+    def _proxy_url(self):
+        return f"http://127.0.0.1:{self.cfg['http_port']}"
+
+    def _score_ip(self, ip):
+        try:
+            return cleanip.full_check(ip, proxy=self._proxy_url(),
+                                      key=self.cfg.get('cleanip_key', ''))
+        except Exception as e:
+            self.log(f'IP 评分失败：{e}')
+            return None
+
     def _auto_ip_check(self):
         d = core.ip_health(self.cfg['http_port'])
         if not d:
             self.log('IP 体检：查询失败（可手动点「IP 体检」重试）')
             return
-        level, issues, _ = core.ip_health_verdict(d)
-        tag = {'good': '✅ 干净', 'warn': '⚠ 机房 IP', 'bad': '⛔ 已被标记代理'}[level]
-        extra = ''
-        if d.get('timezone'):
-            extra = f"  时区 {d['timezone']}"
-        self.log(f"IP 体检：{tag} | {d.get('query')} {d.get('countryCode')} "
-                 f"{(d.get('org') or d.get('isp') or '')[:32]}{extra}")
+        r = self._score_ip(d.get('query'))
+        if r and r.get('score') is not None:
+            src = 'CleanIP' if r.get('source') == 'cleanip' else '本地估算'
+            self.log(f"IP 体检：{r['score']} 分 {r.get('grade', '')}（{src}） | "
+                     f"{d.get('query')} {d.get('countryCode')} "
+                     f"{(d.get('org') or d.get('isp') or '')[:28]}")
+        else:
+            self.log(f"IP 体检：{d.get('query')} {d.get('countryCode')} "
+                     f"{(d.get('org') or d.get('isp') or '')[:28]}（未能评分）")
 
     def ip_check_click(self):
         if not self.core.running():
@@ -440,53 +454,185 @@ class App:
                 self.log('IP 体检：查询失败')
                 self.q.put(('ip_dialog', None))
                 return
+            r = self._score_ip(d.get('query'))
             self.log(f"IP 体检：{d.get('query')} {d.get('country')} "
                      f"{d.get('org') or d.get('isp') or ''} "
                      f"{'（代理标记）' if d.get('proxy') else ''}"
                      f"{'（机房）' if d.get('hosting') else ''}")
-            self.q.put(('ip_dialog', d))
+            self.q.put(('ip_dialog', (d, r)))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _show_ip_dialog(self, d):
-        if not d:
+    def _show_ip_dialog(self, payload):
+        if not payload:
             messagebox.showwarning('IP 体检', '查询失败，请确认已连接节点')
             return
-        level, issues, tips = core.ip_health_verdict(d)
-        icons = {'good': '✅', 'warn': '⚠️', 'bad': '⛔'}
-        lines = [f"{icons[level]} 出口 IP：{d.get('query')}",
-                 f"    地区：{d.get('country')} {d.get('regionName') or ''} {d.get('city') or ''}",
-                 f"    运营商：{d.get('isp') or '?'}",
-                 f"    ASN：{d.get('as') or '?'}",
-                 f"    时区：{d.get('timezone') or '?'}",
-                 f"    代理标记：{'是（高风险）' if d.get('proxy') else '否'}",
-                 f"    机房 IP：{'是' if d.get('hosting') else '否'}",
-                 '',
-                 '【网站可能看到的"可疑点"】']
-        if issues:
-            lines += [f"  · {x}" for x in issues]
+        if isinstance(payload, tuple):
+            d, r = payload
         else:
-            lines.append('  · 暂无明显的机房/代理标记')
-        lines += ['', '【让它看起来更安全的建议】']
-        lines += [f"  · {x}" for x in (tips or ['保持节点固定，不要频繁换 IP'])]
-        lines += [
-            '  · 关闭浏览器 WebRTC（Edge: 设置→隐私→WebRTC 关闭，或装 WebRTC 控制扩展）',
-            '  · 系统时区/语言与节点地区一致（本工具的「时区跟随」已处理时区）',
-            '  · 关闭 IPv6：网络适配器属性里取消 IPv6，避免代理只走 IPv4 时 IPv6 直连泄漏',
-            '  · 不要用同一 IP 登录多个账号；固定一个节点长期使用',
-            '  · 最有效的还是换「住宅/家宽/原生 IP」节点（机场里通常标"原生"或"住宅"）',
-        ]
+            d, r = payload, None
+        if r is None:
+            r = {'source': 'local', 'score': None, 'grade': '', 'ip_type': '',
+                 'flags': {}, 'findings': [], 'scenarios': {},
+                 'location': {}, 'network': {}, 'report_url': '', 'note': ''}
+
+        score = r.get('score')
+        grade = r.get('grade') or ''
+        src = 'CleanIP 官方' if r.get('source') == 'cleanip' else '本地估算'
+        color = ('#16a34a' if (score or 0) >= 81 else
+                 '#2563eb' if (score or 0) >= 66 else
+                 '#d97706' if (score or 0) >= 46 else '#dc2626')
+        flags = r.get('flags') or {}
+        loc = r.get('location') or {}
+        net = r.get('network') or {}
+
         win = tk.Toplevel(self.root)
-        win.title('IP 体检')
-        win.transient(self.root)
-        win.geometry('640x520')
+        win.title('IP 体检 — 纯净度评分')
+        win.geometry('900x740')
         win.configure(bg=BG)
-        txt = tk.Text(win, wrap='word', font=('Microsoft YaHei UI', 10), bg='#ffffff',
-                      fg='#2d3748', relief='solid', bd=1, padx=10, pady=10)
-        txt.pack(fill='both', expand=True, padx=10, pady=10)
-        txt.insert('1.0', '\n'.join(lines))
-        txt.configure(state='disabled')
-        ttk.Button(win, text='关闭', command=win.destroy).pack(pady=(0, 10))
+        win.transient(self.root)
+
+        # 顶部评分卡
+        head = tk.Frame(win, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        head.pack(fill='x', padx=12, pady=(12, 8))
+        hi = tk.Frame(head, bg=CARD, padx=18, pady=14)
+        hi.pack(fill='x')
+        left = tk.Frame(hi, bg=CARD)
+        left.pack(side='left')
+        tk.Label(left, text=f"{score if score is not None else '—'}",
+                 bg=CARD, fg=color, font=('Microsoft YaHei UI', 40, 'bold')).pack(anchor='w')
+        tk.Label(left, text=f"等级 {grade or '?'}   ·   {src}", bg=CARD, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9)).pack(anchor='w')
+        mid = tk.Frame(hi, bg=CARD)
+        mid.pack(side='left', padx=(26, 0), fill='x', expand=True)
+        tk.Label(mid, text=f"出口 IP  {d.get('query') or loc.get('country_code') or '?'}",
+                 bg=CARD, fg=TEXT, font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w')
+        country = loc.get('country') or d.get('country') or ''
+        region = loc.get('region') or d.get('regionName') or ''
+        city = loc.get('city') or d.get('city') or ''
+        tk.Label(mid, text=f"{country} {region} {city}".strip(),
+                 bg=CARD, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(3, 0))
+        asn = net.get('asn') or d.get('as') or ''
+        org = net.get('as_name') or d.get('org') or d.get('isp') or ''
+        tk.Label(mid, text=f"ASN {asn}   {org}".strip(),
+                 bg=CARD, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(2, 0))
+        right = tk.Frame(hi, bg=CARD)
+        right.pack(side='right')
+        if r.get('source') != 'cleanip':
+            ttk.Button(right, text='配置 CleanIP 密钥', style='Ghost.TButton',
+                       command=lambda: (win.destroy(), self.open_settings())).pack(anchor='e', pady=(0, 4))
+        ttk.Button(right, text='打开 CleanIP 报告', style='Ghost.TButton',
+                   command=lambda: self._open_url(r.get('report_url') or
+                                                  f"https://cleanip.io/{d.get('query', '')}")
+                   ).pack(anchor='e')
+        tk.Label(right, text=r.get('note') or '', bg=CARD, fg=MUTED, wraplength=240,
+                 justify='right', font=('Microsoft YaHei UI', 8)).pack(anchor='e', pady=(6, 0))
+
+        # 标签行
+        chips = tk.Frame(win, bg=BG)
+        chips.pack(fill='x', padx=14, pady=(0, 6))
+        chip_defs = [('代理', flags.get('proxy'), ERRC), ('VPN', flags.get('vpn'), ERRC),
+                     ('Tor', flags.get('tor'), ERRC), ('机房/IDC', flags.get('hosting'), WARNC),
+                     ('滥用记录', flags.get('abuse'), WARNC)]
+        tk.Label(chips, text=f"类型：{r.get('ip_type') or '未知'}", bg=BG, fg=TEXT,
+                 font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left', padx=(0, 10))
+        for text, on, col in chip_defs:
+            if on:
+                tk.Label(chips, text=f' {text} ', bg=col, fg='white',
+                         font=('Microsoft YaHei UI', 8, 'bold')).pack(side='left', padx=3)
+        if not any(x[1] for x in chip_defs):
+            tk.Label(chips, text=' 未发现代理/VPN/机房 标记 ', bg=OKC, fg='white',
+                     font=('Microsoft YaHei UI', 8, 'bold')).pack(side='left')
+
+        # 主体两栏
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+        lf = tk.Frame(body, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        lf.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+        lfi = tk.Frame(lf, bg=CARD, padx=12, pady=10)
+        lfi.pack(fill='both', expand=True)
+        tk.Label(lfi, text='评分依据', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w')
+        box = tk.Text(lfi, wrap='word', height=13, font=('Microsoft YaHei UI', 9),
+                      bg=CARD, fg=TEXT, relief='flat', bd=0, padx=2, pady=4)
+        box.pack(fill='both', expand=True, pady=(4, 0))
+        findings = r.get('findings') or []
+        if findings:
+            for f in findings:
+                if isinstance(f, dict):
+                    desc = f.get('desc') or f.get('description') or f.get('code') or ''
+                    delta = f.get('delta') or f.get('penalty') or f.get('points')
+                    sev = f.get('severity') or ''
+                    line = f"· {desc}"
+                    if sev:
+                        line += f"（{sev}）"
+                    if isinstance(delta, (int, float)) and delta:
+                        line += f"  {delta:+g}"
+                else:
+                    line = f"· {f}"
+                box.insert('end', line + '\n')
+        else:
+            box.insert('end', '· 未发现明确的扣分项\n')
+        if r.get('coverage'):
+            box.insert('end', f"\n覆盖：{r.get('coverage')}\n")
+        box.configure(state='disabled')
+
+        rf = tk.Frame(body, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        rf.grid(row=0, column=1, sticky='nsew')
+        rfi = tk.Frame(rf, bg=CARD, padx=12, pady=10)
+        rfi.pack(fill='both', expand=True)
+        tk.Label(rfi, text='建议', bg=CARD, fg=TEXT,
+                 font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w')
+        tips = []
+        if flags.get('tor'):
+            tips.append('Tor 出口几乎无法通过正常站点风控，建议更换节点')
+        if flags.get('vpn') or flags.get('proxy'):
+            tips.append('该 IP 已被标记为代理/VPN，优先换未被标记的节点')
+        if flags.get('hosting'):
+            tips.append('机房 IP 容易被重点观察，优先选「住宅/家宽/原生 IP」节点')
+        if (score or 0) >= 81 and not (flags.get('vpn') or flags.get('proxy') or flags.get('tor')):
+            tips.append('分数不错：固定使用这个节点，避免频繁换 IP')
+        tips += [
+            '关闭浏览器 WebRTC（防止真实 IP 泄漏）',
+            '关闭 IPv6，避免代理只走 IPv4 时直连泄漏',
+            '系统时区/语言与节点地区保持一致（「时区跟随」可自动处理）',
+            '不要用同一 IP 登录多个账号',
+        ]
+        tb = tk.Text(rfi, wrap='word', height=13, font=('Microsoft YaHei UI', 9),
+                     bg=CARD, fg=TEXT, relief='flat', bd=0, padx=2, pady=4)
+        tb.pack(fill='both', expand=True, pady=(4, 0))
+        for t in tips:
+            tb.insert('end', f'· {t}\n')
+        tb.configure(state='disabled')
+
+        # 场景适配（官方数据才有）
+        scen = r.get('scenarios') or {}
+        if scen:
+            sf = tk.Frame(win, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+            sf.pack(fill='x', padx=12, pady=(0, 6))
+            sfi = tk.Frame(sf, bg=CARD, padx=12, pady=8)
+            sfi.pack(fill='x')
+            tk.Label(sfi, text='场景适配', bg=CARD, fg=TEXT,
+                     font=('Microsoft YaHei UI', 10, 'bold')).pack(anchor='w')
+            row = tk.Frame(sfi, bg=CARD)
+            row.pack(anchor='w', pady=(4, 0))
+            for k, v in list(scen.items())[:8]:
+                if isinstance(v, dict):
+                    v = v.get('score') or v.get('grade') or ''
+                tk.Label(row, text=f'{k} {v}', bg='#eef2f9', fg=TEXT,
+                         font=('Microsoft YaHei UI', 8), padx=8, pady=3).pack(side='left', padx=3)
+
+        ttk.Button(win, text='关闭', style='Primary.TButton', command=win.destroy).pack(pady=(0, 12))
+
+    def _open_url(self, url):
+        try:
+            if url:
+                os.startfile(url)
+        except Exception:
+            pass
 
     def _apply_tz(self):
         if not self.cfg.get('tz_follow'):
@@ -1479,88 +1625,123 @@ class App:
         win.title('设置')
         win.transient(self.root)
         win.grab_set()
-        win.geometry('620x880')
+        win.geometry('680x760')
         win.configure(bg=BG)
         head = tk.Frame(win, bg=BG)
         head.pack(fill='x', padx=18, pady=(14, 0))
         tk.Label(head, text='设置', bg=BG, fg=TEXT,
                  font=('Microsoft YaHei UI', 15, 'bold')).pack(anchor='w')
-        frm = ttk.Frame(win, padding=(18, 10, 18, 16))
-        frm.pack(fill='both', expand=True)
+        tk.Label(head, text='端口与订阅在「基础」，日志与 IP 评分在「高级」',
+                 bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(2, 0))
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill='both', expand=True, padx=12, pady=(10, 6))
+        basic = ttk.Frame(nb, padding=14)
+        adv = ttk.Frame(nb, padding=14)
+        nb.add(basic, text=' 基础 ')
+        nb.add(adv, text=' 高级 / IP 评分 ')
+
         vals = {}
-        rows = (('http_port', 'HTTP 端口'), ('socks_port', 'SOCKS 端口'), ('stats_port', '统计 API 端口'))
+        rows = (('http_port', 'HTTP 端口'), ('socks_port', 'SOCKS 端口'),
+                ('stats_port', '统计 API 端口'))
         for i, (key, label) in enumerate(rows):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky='w', pady=5)
+            ttk.Label(basic, text=label).grid(row=i, column=0, sticky='w', pady=5)
             var = tk.StringVar(value=str(self.cfg[key]))
-            ttk.Entry(frm, textvariable=var, width=12).grid(row=i, column=1, sticky='w', padx=10)
+            ttk.Entry(basic, textvariable=var, width=12).grid(row=i, column=1, sticky='w', padx=10)
             vals[key] = var
-        ttk.Label(frm, text='订阅链接').grid(row=3, column=0, sticky='w', pady=5)
+        ttk.Label(basic, text='订阅链接').grid(row=3, column=0, sticky='w', pady=5)
         sub_var = tk.StringVar(value=self.cfg.get('subscription', ''))
-        ttk.Entry(frm, textvariable=sub_var, width=46).grid(row=3, column=1, columnspan=2, sticky='we', padx=10)
-        ttk.Label(frm, text='自动更新订阅(小时，0=关闭)').grid(row=4, column=0, sticky='w', pady=5)
+        ttk.Entry(basic, textvariable=sub_var, width=46).grid(
+            row=3, column=1, columnspan=2, sticky='we', padx=10)
+        ttk.Label(basic, text='自动更新(小时，0=关)').grid(row=4, column=0, sticky='w', pady=5)
         upd_var = tk.StringVar(value=str(self.cfg.get('auto_update_hours', 0)))
-        ttk.Entry(frm, textvariable=upd_var, width=8).grid(row=4, column=1, sticky='w', padx=10)
+        ttk.Entry(basic, textvariable=upd_var, width=8).grid(row=4, column=1, sticky='w', padx=10)
+
         fa_var = tk.BooleanVar(value=bool(self.cfg.get('auto_failover')))
-        ttk.Checkbutton(frm, text='自动故障切换（不建议用于 Claude：会换出口 IP）',
-                        variable=fa_var).grid(row=5, column=0, columnspan=3, sticky='w', pady=8)
+        ttk.Checkbutton(basic, text='自动故障切换（会换出口 IP，不建议用于 Claude）',
+                        variable=fa_var).grid(row=5, column=0, columnspan=3, sticky='w', pady=6)
         sort_var = tk.BooleanVar(value=bool(self.cfg.get('auto_sort_after_test', True)))
-        ttk.Checkbutton(frm, text='测速后自动按延迟排序', variable=sort_var).grid(
-            row=6, column=0, columnspan=3, sticky='w', pady=2)
+        ttk.Checkbutton(basic, text='测速后自动按延迟排序',
+                        variable=sort_var).grid(row=6, column=0, columnspan=3, sticky='w', pady=2)
+        rec_var = tk.BooleanVar(value=bool(self.cfg.get('auto_reconnect', True)))
+        ttk.Checkbutton(basic, text='断线自动重连（优先原节点，保持出口 IP）',
+                        variable=rec_var).grid(row=7, column=0, columnspan=3, sticky='w', pady=2)
         tray_var = tk.BooleanVar(value=bool(self.cfg.get('minimize_to_tray', True)))
-        cb_tray = ttk.Checkbutton(frm, text='最小化到托盘（关窗口不退出，托盘右键退出）',
-                                  variable=tray_var)
-        cb_tray.grid(row=7, column=0, columnspan=3, sticky='w', pady=2)
+        cb_tray = ttk.Checkbutton(basic, text='最小化到托盘（关窗口不退出）', variable=tray_var)
+        cb_tray.grid(row=8, column=0, columnspan=3, sticky='w', pady=2)
         if not TRAY_OK:
             cb_tray.configure(state='disabled')
         auto_var = tk.BooleanVar(value=autostart_enabled())
-        ttk.Checkbutton(frm, text='开机自启（登录后自动打开本工具）',
-                        variable=auto_var).grid(row=8, column=0, columnspan=3, sticky='w', pady=2)
-
-        rec_var = tk.BooleanVar(value=bool(self.cfg.get('auto_reconnect', True)))
-        ttk.Checkbutton(frm, text='断线自动重连（优先原节点，保持出口 IP 不变）',
-                        variable=rec_var).grid(row=20, column=0, columnspan=3, sticky='w', pady=2)
+        ttk.Checkbutton(basic, text='开机自启（登录后自动打开）',
+                        variable=auto_var).grid(row=9, column=0, columnspan=3, sticky='w', pady=2)
         ip_var = tk.BooleanVar(value=bool(self.cfg.get('auto_ip_check', True)))
-        ttk.Checkbutton(frm, text='连接后自动做 IP 体检（记录 IP 风险画像）',
-                        variable=ip_var).grid(row=13, column=0, columnspan=3, sticky='w', pady=2)
-        ttk.Separator(frm, orient='horizontal').grid(row=9, column=0, columnspan=3,
-                                                     sticky='we', pady=8)
+        ttk.Checkbutton(basic, text='连接后自动做 IP 体检（含纯净度评分）',
+                        variable=ip_var).grid(row=10, column=0, columnspan=3, sticky='w', pady=2)
+
+        ttk.Separator(basic, orient='horizontal').grid(row=11, column=0, columnspan=3,
+                                                       sticky='we', pady=10)
         tz_var = tk.BooleanVar(value=bool(self.cfg.get('tz_follow', True)))
-        cb_tz = ttk.Checkbutton(frm, text='连接后自动切换系统时区（断开恢复北京时间）',
-                                variable=tz_var)
-        cb_tz.grid(row=10, column=0, columnspan=3, sticky='w', pady=2)
+        ttk.Checkbutton(basic, text='连接后自动切换系统时区（断开恢复北京时间）',
+                        variable=tz_var).grid(row=12, column=0, columnspan=3, sticky='w', pady=2)
         admin_txt = ('当前权限：管理员 ✓ 可切换时区' if core.is_admin()
                      else '当前权限：普通用户 ✗ 时区功能不可用，建议用管理员启动器')
-        tk.Label(frm, text=admin_txt, bg=BG, fg=(OKC if core.is_admin() else WARNC),
-                 font=('Microsoft YaHei UI', 9)).grid(row=11, column=0, columnspan=2,
-                                                      sticky='w', pady=(2, 0))
+        tk.Label(basic, text=admin_txt, bg=BG, fg=(OKC if core.is_admin() else WARNC),
+                 font=('Microsoft YaHei UI', 9)).grid(row=13, column=0, columnspan=2,
+                                                      sticky='w', pady=(4, 0))
         if not core.is_admin():
-            ttk.Button(frm, text='以管理员身份重启',
+            ttk.Button(basic, text='以管理员身份重启',
                        command=lambda: (win.destroy(), self.relaunch_as_admin())).grid(
-                row=11, column=2, sticky='e')
+                row=13, column=2, sticky='e')
+        shortcut_row = tk.Frame(basic, bg=BG)
+        shortcut_row.grid(row=14, column=0, columnspan=3, sticky='w', pady=(10, 0))
+        tk.Label(shortcut_row, text='桌面快捷方式：', bg=BG, fg=MUTED,
+                 font=('Microsoft YaHei UI', 9)).pack(side='left')
+        ttk.Button(shortcut_row, text='普通模式', style='Ghost.TButton',
+                   command=lambda: self.create_shortcut(False)).pack(side='left', padx=4)
+        ttk.Button(shortcut_row, text='管理员模式', style='Ghost.TButton',
+                   command=lambda: self.create_shortcut(True)).pack(side='left', padx=4)
 
-        ttk.Separator(frm, orient='horizontal').grid(row=14, column=0, columnspan=3,
-                                                     sticky='we', pady=8)
-        ttk.Label(frm, text='核心日志级别').grid(row=15, column=0, sticky='w', pady=4)
+        # ---- 高级 ----
+        ttk.Label(adv, text='核心日志级别').grid(row=0, column=0, sticky='w', pady=5)
         level_var = tk.StringVar(value=str(self.cfg.get('core_log_level', 'info')))
-        ttk.Combobox(frm, textvariable=level_var, width=10, state='readonly',
+        ttk.Combobox(adv, textvariable=level_var, width=10, state='readonly',
                      values=('none', 'error', 'warning', 'info', 'debug')).grid(
-            row=15, column=1, sticky='w', padx=10)
-        tk.Label(frm, text='（级别越高日志越详细，改完断开重连生效）', bg=BG, fg='#718096',
-                 font=('Microsoft YaHei UI', 8)).grid(row=15, column=2, sticky='w')
+            row=0, column=1, sticky='w', padx=10)
+        tk.Label(adv, text='改完断开重连生效', bg=BG, fg=MUTED,
+                 font=('Microsoft YaHei UI', 8)).grid(row=0, column=2, sticky='w')
         acc_var = tk.BooleanVar(value=bool(self.cfg.get('access_log', True)))
-        ttk.Checkbutton(frm, text='记录访问日志（每个域名的路由明细，显示在运行日志里）',
-                        variable=acc_var).grid(row=16, column=0, columnspan=3, sticky='w', pady=2)
+        ttk.Checkbutton(adv, text='记录访问日志（域名路由明细）',
+                        variable=acc_var).grid(row=1, column=0, columnspan=3, sticky='w', pady=4)
         insecure_var = tk.BooleanVar(value=bool(self.cfg.get('allow_insecure', False)))
-        ttk.Checkbutton(frm, text='允许不校验 TLS 证书（仅自签证书需要，会降低安全性）',
-                        variable=insecure_var).grid(row=18, column=0, columnspan=3, sticky='w', pady=2)
+        ttk.Checkbutton(adv, text='允许不校验 TLS 证书（仅自签证书，会降低安全性）',
+                        variable=insecure_var).grid(row=2, column=0, columnspan=3,
+                                                    sticky='w', pady=4)
+
+        ttk.Separator(adv, orient='horizontal').grid(row=3, column=0, columnspan=3,
+                                                      sticky='we', pady=10)
+        tk.Label(adv, text='IP 纯净度评分（CleanIP）', bg=BG, fg=TEXT,
+                 font=('Microsoft YaHei UI', 11, 'bold')).grid(
+            row=4, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        ttk.Label(adv, text='API 密钥（可选）').grid(row=5, column=0, sticky='w', pady=5)
+        key_var = tk.StringVar(value=str(self.cfg.get('cleanip_key', '')))
+        ttk.Entry(adv, textvariable=key_var, width=40).grid(
+            row=5, column=1, columnspan=2, sticky='we', padx=10)
+        tk.Label(adv, text=('免费账号在 cleanip.io/account 创建密钥（cip_ 开头），免费额度 20 个 IP/天；'
+                            '配置后显示官方评分，未配置则用本地估算。'),
+                 bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 8),
+                 wraplength=560, justify='left').grid(row=6, column=0, columnspan=3,
+                                                      sticky='w', pady=(2, 6))
+        ttk.Button(adv, text='打开 CleanIP 账户页', style='Ghost.TButton',
+                   command=lambda: self._open_url('https://cleanip.io/account?tab=api')).grid(
+            row=7, column=0, sticky='w', pady=(2, 0))
 
         def save():
             try:
                 for k, v in vals.items():
-                    p = int(v.get())
-                    if not (1024 < p < 65535):
+                    port = int(v.get())
+                    if not (1024 < port < 65535):
                         raise ValueError
-                    self.cfg[k] = p
+                    self.cfg[k] = port
                 self.cfg['subscription'] = sub_var.get().strip()
                 self.cfg['auto_update_hours'] = max(0.0, float(upd_var.get() or 0))
                 self.cfg['auto_failover'] = bool(fa_var.get())
@@ -1574,6 +1755,7 @@ class App:
                 self.cfg['access_log'] = bool(acc_var.get())
                 self.cfg['auto_reconnect'] = bool(rec_var.get())
                 self.cfg['allow_insecure'] = bool(insecure_var.get())
+                self.cfg['cleanip_key'] = key_var.get().strip()
                 tray_wanted = bool(tray_var.get())
                 self.cfg['minimize_to_tray'] = tray_wanted
                 core.save_config(self.cfg)
@@ -1589,21 +1771,13 @@ class App:
                 win.destroy()
                 self.refresh()
                 self.log('设置已保存（端口变更需断开重连后生效）')
-            except Exception:
+            except ValueError:
                 messagebox.showerror('设置', '端口需为 1024-65535 之间的整数', parent=win)
 
-        shortcut_row = tk.Frame(frm, bg=BG)
-        shortcut_row.grid(row=12, column=0, columnspan=3, sticky='w', pady=(8, 0))
-        tk.Label(shortcut_row, text='桌面快捷方式：', bg=BG, fg='#4a5568',
-                 font=('Microsoft YaHei UI', 9)).pack(side='left')
-        ttk.Button(shortcut_row, text='创建普通模式',
-                   command=lambda: self.create_shortcut(False)).pack(side='left', padx=4)
-        ttk.Button(shortcut_row, text='创建管理员模式',
-                   command=lambda: self.create_shortcut(True)).pack(side='left', padx=4)
-        ttk.Button(frm, text='保存', style='Primary.TButton', command=save).grid(
-            row=21, column=2, sticky='e', pady=12)
-
-    # ---------------- 托盘 / 窗口 ----------------
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill='x', padx=18, pady=(0, 14))
+        ttk.Button(bar, text='保存', style='Primary.TButton', command=save).pack(side='right')
+        ttk.Button(bar, text='取消', command=win.destroy).pack(side='right', padx=8)
     def _tray_image(self):
         if os.path.exists(TRAY_PNG):
             try:
